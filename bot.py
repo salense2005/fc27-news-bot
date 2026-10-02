@@ -97,6 +97,10 @@ MIN_SENTENCE_LENGTH = 20
 MAX_POST_LENGTH = 1500                  # Telegram hard limit is 4096
 STRICT_NUMBER_CHECK = True              # numbers in a post must exist in the source text
 
+# --- channel footer (clickable word at the very end of every post) ---
+CHANNEL_FOOTER_TEXT = "Lilsalense"
+CHANNEL_URL = "https://t.me/Lilsalense"
+
 # --- fallback ---
 FALLBACK_TRANSLATE = True               # unofficial free translate endpoint, may break
 FALLBACK_MAX_SENTENCES = 4
@@ -385,7 +389,7 @@ def test_telegram():
     return False
 
 
-def send_telegram(message):
+def send_telegram(message, parse_mode=None, plain_fallback=None):
     """Raises on any failure. Returns True only if Telegram confirmed ok=true."""
     if not message:
         raise ValueError("empty message")
@@ -394,6 +398,8 @@ def send_telegram(message):
         "text": message,
         "disable_web_page_preview": True,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     for attempt in range(2):
         resp = requests.post(telegram_url("sendMessage"), json=payload, timeout=(5, 30))
         try:
@@ -406,6 +412,10 @@ def send_telegram(message):
             warn("TELEGRAM", f"Rate limited, waiting {wait}s")
             time.sleep(wait)
             continue
+        if (resp.status_code == 400 and parse_mode and plain_fallback
+                and "parse" in str(data.get("description", "")).lower()):
+            warn("TELEGRAM", "HTML was rejected by Telegram - resending as plain text")
+            return send_telegram(plain_fallback)
         if resp.status_code != 200:
             raise RuntimeError(f"Telegram HTTP {resp.status_code}: {data.get('description', resp.text[:200])}")
         if not data.get("ok"):
@@ -1028,7 +1038,7 @@ REPAIR_SCHEMA = {
     "required": ["title", "body"],
 }
 
-JSON_MODES = ["responseFormat", "legacy", "plain"]
+JSON_MODES = ["legacy", "plain"]   # "responseFormat" is rejected by the live API (HTTP 400)
 _gemini = {"cooldown_until": 0.0, "mode_idx": 0, "model_idx": 0}
 
 
@@ -1261,7 +1271,7 @@ def build_prompt(materials, memory):
         "ЗАПРЕЩЕНО В ТЕКСТЕ ПОСТА:",
         "- Ссылки, названия сайтов-источников, слова 'согласно статье', 'в материале', 'источник сообщает', "
         "вступления ('Вот новости'), текст от первого лица, упоминания ИИ, служебные пометки "
-        "(POST, TOPIC, SOURCE_ID, ARTICLE_ID), markdown и эмодзи (эмодзи добавляет бот).",
+        "(POST, TOPIC, SOURCE_ID, ARTICLE_ID), markdown и эмодзи (эмодзи, оформление и подпись канала добавляет бот).",
         "",
         "ФОРМАТ ОТВЕТА: только валидный JSON без пояснений и без markdown - объект с полем posts "
         "(массив объектов с полями source_ids, category, title, body, topic).",
@@ -1380,6 +1390,61 @@ def normalize_category(raw):
     key = key.split(" ")[-1] if key and key not in CATEGORY_LABELS and key not in CATEGORY_ALIASES else key
     key = CATEGORY_ALIASES.get(key, key)
     return key if key in CATEGORY_LABELS else "NEWS"
+
+
+# ============================================================
+# POST FORMATTING (emojis, bold title, clickable channel footer)
+# ============================================================
+
+EMOJI_RULES = [
+    (r"награ|пакет|набор|приз|\bpack", "🎁"),
+    (r"дн(?:я|ей|и)\b|недел|срок|в течение|до \d|часов|\bчас\b", "⏳"),
+    (r"монет|цен[аеуы]|стоимост|coins", "💰"),
+    (r"рейтинг|\bovr\b|оценк", "📈"),
+    (r"патч|обновлен|исправл|\bбаг|фикс|ошибк", "🛠"),
+    (r"слух|утечк|по данным|сообща|предположительно|по информации", "👀"),
+    (r"тактик|формаци|\bмет[аыу]\b", "🧠"),
+    (r"геймплей|механик|управлен|анимаци", "🎮"),
+    (r"цел[иь]|задани|objective|милстоун", "🎯"),
+    (r"эволюц|evolution", "🔄"),
+    (r"\bsbc\b|состав|сквад|требовани", "🃏"),
+    (r"выйд|вышел|вышла|вышло|релиз|появил|стартов|запуст|доступн|добавил|ввел|ввели", "✅"),
+    (r"режим карьеры|карьер|career", "🏆"),
+    (r"promo|промо|событи", "🟣"),
+    (r"игрок|карточк|защитник|нападающ|полузащитник|вратар", "⭐"),
+]
+DEFAULT_EMOJIS = ["📌", "🔹", "💬", "➡️"]
+
+
+def pick_emoji(sentence, used):
+    low = sentence.lower()
+    for pattern, emoji in EMOJI_RULES:
+        if emoji not in used and re.search(pattern, low):
+            return emoji
+    for emoji in DEFAULT_EMOJIS:
+        if emoji not in used:
+            return emoji
+    return "🔹"
+
+
+def format_post(category, title, sentences):
+    """Returns (plain_text_for_memory, html_for_telegram, plain_with_footer_for_fallback)."""
+    used, lines = set(), []
+    for sentence in sentences:
+        s = re.sub(r"^[^\w«\"(\[]+", "", sentence).strip()      # drop emojis/bullets the model may have added
+        emoji = pick_emoji(s, used)
+        used.add(emoji)
+        lines.append(f"{emoji} {s}")
+    lead, rest = lines[0], lines[1:]
+    body = lead + ("\n\n" + "\n".join(rest) if rest else "")
+    header = f"📰 LILSNEWS | {CATEGORY_LABELS[category]}"
+
+    plain = f"{header}\n\n{title}\n\n{body}"
+    esc = lambda x: html.escape(x, quote=False)
+    html_text = (f"{esc(header)}\n\n<b>{esc(title)}</b>\n\n{esc(body)}"
+                 f"\n\n<a href=\"{CHANNEL_URL}\">{esc(CHANNEL_FOOTER_TEXT)}</a>")
+    plain_footer = f"{plain}\n\n{CHANNEL_FOOTER_TEXT}: {CHANNEL_URL}"
+    return plain, html_text, plain_footer
 
 
 # ============================================================
@@ -1532,15 +1597,15 @@ def validate_item(item, materials_by_id):
             return None, "unsupported_numbers", "not in source: " + ", ".join(bad[:5])
 
     category = normalize_category(item.get("category", ""))
-    label = CATEGORY_LABELS[category]
-    text = f"📰 LILSNEWS | {label}\n\n{title}\n\n{body_final}"
-
-    if SERVICE_RE.search(text.split("\n\n", 1)[1]):
+    if SERVICE_RE.search(title + "\n" + body_final):
         return None, "service_text", "service text after processing"
+
+    text, text_html, text_plain_footer = format_post(category, title, unique)
 
     topic = clean_text(item.get("topic", "")) or title
     return {
-        "text": text, "title": title, "body": body_final, "category": category,
+        "text": text, "text_html": text_html, "text_plain_footer": text_plain_footer,
+        "title": title, "body": body_final, "category": category,
         "topic": topic[:150], "sources": sources,
     }, "ok", ""
 
@@ -1596,7 +1661,7 @@ def publish_post(post, memory, current_posts):
     """Send to Telegram. Memory is updated ONLY after a confirmed successful send."""
     log("PUBLISH", f"Sending: {post['title'][:90]}")
     try:
-        send_telegram(post["text"])
+        send_telegram(post["text_html"], parse_mode="HTML", plain_fallback=post["text_plain_footer"])
     except Exception as exc:
         error("PUBLISH", f"Telegram send failed: {err_text(exc)}")
         return False
