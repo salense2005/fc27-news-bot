@@ -1,9 +1,10 @@
 name: FC27 News Bot
 
 on:
-  workflow_dispatch:
   schedule:
     - cron: "*/30 * * * *"
+
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -19,7 +20,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
 
       - name: Run bot
         env:
