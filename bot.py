@@ -3,6 +3,7 @@ import json
 import time
 import requests
 import feedparser
+from bs4 import BeautifulSoup
 from google import genai
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -16,11 +17,11 @@ RSS_FEEDS = [
     "https://news.google.com/rss/search?q=EA%20FC%2027%20SBC&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=EA%20FC%2027%20players&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=EA%20FC%2027%20meta&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=EA%20FC%2027%20tactics&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=EA%20FC%2027%20gameplay&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=EA%20FC%2027%20leaks&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=EA%20FC%2027%20promo&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=EA%20FC%2027%20patch&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027 tactics&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027 gameplay&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027 leaks&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027 promo&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027 patch&hl=en-US&gl=US&ceid=US:en",
 ]
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -54,13 +55,12 @@ def load_memory():
                 return data
 
     except Exception as error:
-        print(f"Memory read error: {error}")
+        print(f"Memory error: {error}")
 
     return []
 
 
 def save_memory(memory):
-    # Храним только последние 200 событий
     memory = memory[-200:]
 
     with open(MEMORY_FILE, "w", encoding="utf-8") as file:
@@ -77,6 +77,7 @@ def get_news():
     seen_links = set()
 
     for feed_url in RSS_FEEDS:
+
         try:
             feed = feedparser.parse(feed_url)
 
@@ -101,231 +102,382 @@ def get_news():
         except Exception as error:
             print(f"RSS error: {error}")
 
-    return news[:60]
+    return news[:40]
 
 
-def analyze_news(news, memory):
+def extract_article_text(url):
+    """
+    Открывает статью и пытается получить её основной текст.
+    """
 
-    news_text = ""
+    try:
 
-    for index, item in enumerate(news, start=1):
-        news_text += (
-            f"{index}. {item['title']}\n"
-            f"LINK: {item['link']}\n\n"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/130 Safari/537.36"
+            )
+        }
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=20,
+            allow_redirects=True
         )
+
+        if response.status_code != 200:
+            print(
+                f"Article request failed: "
+                f"{response.status_code}"
+            )
+            return ""
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        # Убираем ненужные элементы
+        for element in soup([
+            "script",
+            "style",
+            "nav",
+            "header",
+            "footer",
+            "aside",
+            "form",
+            "noscript"
+        ]):
+            element.decompose()
+
+        paragraphs = []
+
+        for paragraph in soup.find_all("p"):
+
+            text = paragraph.get_text(
+                " ",
+                strip=True
+            )
+
+            if len(text) < 40:
+                continue
+
+            paragraphs.append(text)
+
+        article_text = "\n".join(paragraphs)
+
+        # Ограничиваем объём, чтобы не отправлять
+        # гигантские статьи в Gemini
+        return article_text[:18000]
+
+    except Exception as error:
+
+        print(
+            f"Article extraction error: {error}"
+        )
+
+        return ""
+
+
+def prepare_sources(news):
+    """
+    Для каждой новости пытаемся получить
+    полный текст статьи.
+    """
+
+    sources = []
+
+    for index, item in enumerate(news):
+
+        print(
+            f"Reading article "
+            f"{index + 1}/{len(news)}: "
+            f"{item['title']}"
+        )
+
+        article_text = extract_article_text(
+            item["link"]
+        )
+
+        sources.append({
+            "title": item["title"],
+            "link": item["link"],
+            "text": article_text
+        })
+
+        # Небольшая пауза между запросами
+        time.sleep(1)
+
+    return sources
+
+
+def analyze_news(sources, memory):
+
+    sources_text = ""
+
+    for index, source in enumerate(
+        sources,
+        start=1
+    ):
+
+        sources_text += f"""
+========================
+МАТЕРИАЛ {index}
+========================
+
+ЗАГОЛОВОК:
+{source['title']}
+
+ССЫЛКА:
+{source['link']}
+
+ТЕКСТ СТАТЬИ:
+{source['text'][:12000]}
+
+"""
 
     memory_text = ""
 
     for item in memory[-100:]:
-        memory_text += (
-            f"- {item.get('topic', '')}\n"
-            f"  POST: {item.get('post', '')}\n\n"
-        )
+
+        memory_text += f"""
+TOPIC:
+{item.get('topic', '')}
+
+POST:
+{item.get('post', '')}
+
+"""
 
     prompt = f"""
-Ты — редактор Telegram-канала LilsNews про EA SPORTS FC 27.
+Ты — главный редактор Telegram-канала LilsNews
+про EA SPORTS FC 27.
 
-Твоя главная задача — находить НОВЫЕ и действительно важные события
-в FC 27.
+Твоя задача — находить реально важные события
+для игроков FC 27.
 
-Найденные сейчас материалы:
+У тебя есть НЕ только заголовки, но и тексты статей.
 
-{news_text}
+МАТЕРИАЛЫ:
+
+{sources_text}
 
 ==================================================
-УЖЕ ОПУБЛИКОВАННЫЕ НОВОСТИ
+УЖЕ ОПУБЛИКОВАНО
 ==================================================
 
 {memory_text}
 
 ==================================================
-КРИТИЧЕСКИ ВАЖНО: НЕ ДЕЛАЙ ДУБЛИКИ
+ГЛАВНОЕ ПРАВИЛО
 ==================================================
 
-Перед созданием поста сравни найденные материалы с уже опубликованными
-новостями.
+НЕ ПУБЛИКУЙ одну и ту же новость повторно.
 
-Если найденная новость рассказывает О ТОМ ЖЕ СОБЫТИИ и НЕ содержит
-существенно новой информации — НЕ публикуй её.
-
-Ответ:
+Если новая статья просто повторяет уже опубликованную
+информацию — ответь:
 
 NO_NEWS
 
-Пример:
+НО:
 
-Ранее:
-"⚠️ СЛУХ — Destined for Glory Team 2"
-
-Сейчас:
-"В сети снова появился слух о Destined for Glory Team 2"
-
-Это ДУБЛИКАТ.
-
-Ответ:
-
-NO_NEWS
-
-==================================================
-НОВАЯ ИНФОРМАЦИЯ ПО СТАРОЙ ТЕМЕ
-==================================================
-
-Если тема уже публиковалась, но появилась СУЩЕСТВЕННО НОВАЯ информация,
-новость можно публиковать снова.
+Если по уже известной теме появилась новая конкретная
+информация — её можно опубликовать.
 
 Например:
 
-Старый пост:
-"⚠️ СЛУХ — Destined for Glory Team 2"
+Старое:
+"Destined for Glory Team 2 leaked."
 
-Новая информация:
+Новое:
 "Стали известны конкретные игроки и рейтинги."
 
-Это НЕ дубликат.
+Это НОВАЯ информация.
 
-В таком случае публикуй новую информацию.
-
-Но НЕ пересказывай старую информацию заново.
-
-Пиши именно:
-
-"Что стало известно нового?"
+В таком случае публикуй именно новые данные.
 
 ==================================================
-ПРИОРИТЕТ
+КОНКРЕТИКА — ОБЯЗАТЕЛЬНО
 ==================================================
 
-🔥 META
-- новые мета-тактики;
-- формации;
-- новые механики;
-- OP-удары;
-- OP-пасы;
-- сильные игроки;
+Если статья содержит конкретные данные,
+ОБЯЗАТЕЛЬНО используй их.
+
+Особенно:
+
+- имена игроков;
+- рейтинг OVR;
+- позиция;
+- характеристики;
 - PlayStyles;
-- то, что используют сильные игроки.
-
-🃏 ULTIMATE TEAM
-- новые SBC;
-- новые карты;
+- название карты;
+- название промо;
+- SBC;
+- стоимость SBC;
+- требования;
+- дата выхода;
+- дата окончания;
 - Objectives;
-- Evolutions;
-- награды;
-- промо.
+- Evolution;
+- тактики;
+- формации;
+- изменения геймплея;
+- изменения меты;
+- данные о рынке.
 
-🎮 GAMEPLAY
-- важные изменения;
-- патчи;
-- изменения механик.
+НИКОГДА не заменяй конкретные данные
+общими словами.
 
-⚡ ТАКТИКИ
-- новые сильные схемы;
-- инструкции;
-- тактики про-игроков.
+ПЛОХО:
 
-💰 MARKET
-- сильные изменения цен;
-- выгодные карты;
-- важные события рынка.
+"В сеть слили список игроков."
 
-👀 LEAKS
-- новые промо;
-- составы;
-- карты;
-- рейтинги;
-- даты.
+ХОРОШО:
 
-==================================================
-ОСОБЕННО ВАЖНО ДЛЯ SBC
-==================================================
-
-Если найден новый SBC, обязательно постарайся показать:
-
-- название SBC;
-- игрока/награду;
-- рейтинг;
-- позицию;
-- стоимость, если она известна;
-- срок действия;
-- важные требования, если они интересны;
-- что делает карту интересной.
-
-НЕ пиши просто:
-
-"Вышел новый SBC."
-
-Нужно дать КОНКРЕТИКУ.
-
-==================================================
-ОСОБЕННО ВАЖНО ДЛЯ КАРТ И СЛИВОВ
-==================================================
-
-Если известны конкретные игроки, обязательно укажи их.
-
-Например:
+"В сеть слили:
 
 🟣 Haaland — 91 OVR
 🟣 Diani — 88 OVR
-🟣 Upamecano — 88 OVR
+🟣 Upamecano — 88 OVR"
 
-Если известны рейтинги — показывай рейтинги.
+Если в статье есть эти данные,
+они ДОЛЖНЫ попасть в пост.
 
-Если известны позиции — показывай позиции.
+==================================================
+SBC
+==================================================
 
-Если известны PlayStyles — показывай важные PlayStyles.
+Если появился новый SBC,
+постарайся показать:
 
-Если данных нет — НЕ ПРИДУМЫВАЙ.
+🃏 Игрок / награда
+⭐ Рейтинг
+📍 Позиция
+💰 Стоимость
+⏳ Срок
+📌 Главное преимущество карты
+
+Не пиши просто:
+
+"В FC 27 появился новый SBC."
+
+Это бесполезно.
+
+==================================================
+META
+==================================================
+
+Особый приоритет:
+
+🔥 новые мета-тактики;
+🔥 новые формации;
+🔥 сильные игроки;
+🔥 OP-механики;
+🔥 эффективные удары;
+🔥 эффективные пасы;
+🔥 PlayStyles;
+🔥 находки про-игроков;
+🔥 изменения меты после патча.
+
+Если появляется информация,
+которая может помочь игроку выигрывать матчи,
+это высокий приоритет.
+
+==================================================
+СЛУХИ
+==================================================
+
+Если информация не подтверждена официально:
+
+⚠️ СЛУХ
+
+Но даже для слуха нужно показывать
+КОНКРЕТИКУ, если она есть.
+
+Не:
+
+"Инсайдеры раскрыли список игроков."
+
+А:
+
+"В сеть утекли:
+
+🟣 Haaland — 91
+🟣 Diani — 88
+🟣 Upamecano — 88"
 
 ==================================================
 СТИЛЬ
 ==================================================
 
-Пост должен быть коротким, но информативным.
+Пост:
 
-Примерно 30–80 слов.
+30–100 слов.
 
-Коротко НЕ означает "убрать все факты".
+Короткий.
 
-Убирай воду, но сохраняй конкретику.
+Информативный.
 
-НЕ пиши:
+Без воды.
+
+Человек должен понять новость
+за несколько секунд.
+
+Но НЕ сокращай пост настолько,
+чтобы исчезли важные факты.
+
+==================================================
+НЕ ПИШИ
+==================================================
 
 "Готовьте монеты!"
+
 "Не пропустите!"
+
 "Это изменит игру!"
+
 "Топовая карта!"
+
 "Звёзды на подходе!"
 
-если это не подтверждено конкретными фактами.
+"Следите за обновлениями!"
+
+если это просто пустые фразы.
+
+Не придумывай факты.
 
 ==================================================
-ИСТОЧНИКИ
+ИСТОЧНИК
 ==================================================
 
-Не показывай источник.
+НЕ показывай источник.
 
-Не добавляй ссылки.
+НЕ добавляй ссылки.
 
-Не пиши:
+НЕ пиши:
 
 "Источник:"
 "Подробнее:"
 "Читать далее:"
 
 ==================================================
-СЛУХИ
+ЕСЛИ НЕТ ХОРОШЕЙ НОВОСТИ
 ==================================================
 
-Если информация не подтверждена официально,
-начни пост:
+Ответ:
 
-⚠️ СЛУХ
+NO_NEWS
 
 ==================================================
 ФОРМАТ
 ==================================================
 
-Возвращай ТОЛЬКО готовый Telegram-пост.
+Верни только готовый Telegram-пост.
+
+После поста обязательно добавь:
+
+TOPIC: короткое название события
 
 Пример:
 
@@ -339,31 +491,9 @@ NO_NEWS
 🟣 Diani — 88 OVR
 🟣 Upamecano — 88 OVR
 
-Некоторые карты могут получить дополнительные апгрейды.
+Также появились данные о возможных апгрейдах.
 
-==================================================
-ЕСЛИ НЕТ НОВОЙ ВАЖНОЙ ИНФОРМАЦИИ
-==================================================
-
-Ответь строго:
-
-NO_NEWS
-
-==================================================
-ФОРМАТ ДЛЯ СИСТЕМЫ
-==================================================
-
-После готового поста ОБЯЗАТЕЛЬНО добавь отдельную строку:
-
-TOPIC: короткое название события
-
-Например:
-
-TOPIC: Destined for Glory Team 2
-
-Это нужно для того, чтобы бот мог распознавать повторные новости.
-
-Не добавляй ничего после строки TOPIC.
+TOPIC: Destined for Glory Team 2 players leak
 """
 
     models = [
@@ -378,22 +508,23 @@ TOPIC: Destined for Glory Team 2
             try:
 
                 print(
-                    f"Trying model: {model}, "
-                    f"attempt: {attempt + 1}"
+                    f"Trying {model}, "
+                    f"attempt {attempt + 1}"
                 )
 
                 response = client.models.generate_content(
                     model=model,
-                    contents=prompt,
+                    contents=prompt
                 )
 
                 if response and response.text:
+
                     return response.text.strip()
 
             except Exception as error:
 
                 print(
-                    f"Gemini error with {model}: {error}"
+                    f"Gemini error: {error}"
                 )
 
                 if attempt < 2:
@@ -408,50 +539,99 @@ def extract_topic(result):
 
     topic = ""
 
+    post_lines = []
+
     for line in lines:
 
         if line.strip().startswith("TOPIC:"):
+
             topic = line.split(
                 "TOPIC:",
                 1
             )[1].strip()
 
-    # Убираем TOPIC из сообщения Telegram
-    post_lines = [
-        line
-        for line in lines
-        if not line.strip().startswith("TOPIC:")
-    ]
+        else:
 
-    post = "\n".join(post_lines).strip()
+            post_lines.append(line)
+
+    post = "\n".join(
+        post_lines
+    ).strip()
 
     return post, topic
 
 
+def is_duplicate(topic, memory):
+
+    new_topic = topic.lower().strip()
+
+    for item in memory:
+
+        old_topic = item.get(
+            "topic",
+            ""
+        ).lower().strip()
+
+        if not old_topic:
+            continue
+
+        if old_topic == new_topic:
+            return True
+
+    return False
+
+
 def main():
 
+    print("================================")
     print("LilsNews started")
+    print("================================")
 
     memory = load_memory()
 
     print(
-        f"Memory contains {len(memory)} published events"
+        f"Memory: {len(memory)} events"
     )
 
     news = get_news()
 
     print(
-        f"Found {len(news)} current news items"
+        f"Found {len(news)} news items"
     )
 
     if not news:
 
-        print("No news found")
+        print("No news found.")
+
+        return
+
+    # НОВОЕ:
+    # читаем сами статьи
+    sources = prepare_sources(news)
+
+    # Отбрасываем материалы,
+    # где вообще не удалось получить текст
+    useful_sources = [
+        source
+        for source in sources
+        if source["text"]
+    ]
+
+    print(
+        f"Successfully read "
+        f"{len(useful_sources)} articles"
+    )
+
+    if not useful_sources:
+
+        print(
+            "Could not read any articles."
+        )
 
         return
 
     result = analyze_news(
-        news,
+        useful_sources,
         memory
     )
 
@@ -459,7 +639,8 @@ def main():
 
         send_telegram(
             "⚠️ LilsNews\n\n"
-            "Новости найдены, но Gemini временно недоступен."
+            "Новости найдены, но Gemini "
+            "временно недоступен."
         )
 
         return
@@ -472,39 +653,36 @@ def main():
 
         return
 
-    post, topic = extract_topic(result)
+    post, topic = extract_topic(
+        result
+    )
 
     if not post:
 
-        print("Empty post")
+        print(
+            "Gemini returned empty post."
+        )
 
         return
 
     if not topic:
 
         print(
-            "WARNING: Gemini did not provide TOPIC"
+            "No TOPIC received."
         )
 
-        topic = post[:100]
+        return
 
-    # Дополнительная защита от точного повтора
-    for item in memory:
+    if is_duplicate(
+        topic,
+        memory
+    ):
 
-        old_topic = item.get(
-            "topic",
-            ""
-        ).lower().strip()
+        print(
+            f"Duplicate blocked: {topic}"
+        )
 
-        new_topic = topic.lower().strip()
-
-        if old_topic and old_topic == new_topic:
-
-            print(
-                f"Duplicate topic detected: {topic}"
-            )
-
-            return
+        return
 
     send_telegram(
         "📰 LILSNEWS\n\n"
@@ -520,7 +698,7 @@ def main():
     save_memory(memory)
 
     print(
-        f"Post sent and saved: {topic}"
+        f"Published: {topic}"
     )
 
 
