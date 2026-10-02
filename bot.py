@@ -3,7 +3,6 @@ import json
 import time
 import re
 import html
-from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote_plus
 
@@ -15,27 +14,18 @@ from bs4 import BeautifulSoup
 # ============================================================
 # LILSNEWS — EA SPORTS FC 27 TELEGRAM NEWS BOT
 #
-# VERSION 2
+# FIXED VERSION
 #
-# Основные изменения:
-#   - несколько новостей за один цикл;
-#   - до 5 постов за один запрос Gemini;
-#   - защита от дубликатов;
-#   - RSS fallback;
-#   - Gemini 429 protection;
-#   - не теряет новости, которые не были опубликованы;
-#   - память хранит только реально опубликованные источники;
-#   - автоматический fallback без Gemini;
-#
-# УСТАНОВИ:
-#   pip install requests feedparser beautifulsoup4
-#
-# НУЖНЫ:
-#   TELEGRAM_TOKEN
-#   TELEGRAM_CHAT_ID
-#   GEMINI_API_KEY
-#
-# Лучше задавать ключи через переменные окружения.
+# Исправлено:
+#   - ThreadPoolExecutor импортирован корректно
+#   - несколько новостей за один цикл
+#   - до 5 постов за один запрос Gemini
+#   - защита от дубликатов
+#   - RSS fallback
+#   - Gemini 429 protection
+#   - память хранит опубликованные новости
+#   - если Gemini недоступен — бот продолжает работать
+#   - ошибки одной статьи не ломают весь цикл
 # ============================================================
 
 
@@ -59,32 +49,31 @@ GEMINI_API_KEY = os.getenv(
 )
 
 
-# ------------------------------------------------------------
-# Основные настройки
-# ------------------------------------------------------------
+# ============================================================
+# ОСНОВНЫЕ НАСТРОЙКИ
+# ============================================================
 
 MEMORY_FILE = "published_news.json"
 
-# Как часто проверять новости.
-# 10 минут = 600 секунд.
+# Проверка новостей каждые 5 минут.
 CHECK_INTERVAL = 5 * 60
 
-# Сколько элементов брать из каждого Google News RSS.
+# Сколько новостей брать из каждого RSS-запроса.
 MAX_RSS_ITEMS_PER_QUERY = 10
 
-# Максимальное количество свежих кандидатов после фильтрации.
+# Максимальное количество кандидатов после фильтрации.
 MAX_CANDIDATES = 30
 
-# Сколько статей реально скачивать.
+# Максимальное количество статей, которые реально скачиваем.
 MAX_ARTICLES_TO_FETCH = 18
 
 # Максимум постов за один цикл.
 MAX_POSTS_PER_CYCLE = 5
 
-# Максимум символов статьи для Gemini.
+# Максимум текста статьи для Gemini.
 MAX_ARTICLE_CHARS = 9000
 
-# Timeout загрузки статьи.
+# Timeout статьи.
 ARTICLE_TIMEOUT = 10
 
 # Timeout Google News redirect.
@@ -93,24 +82,22 @@ GOOGLE_REDIRECT_TIMEOUT = 15
 # Gemini model.
 GEMINI_MODEL = "gemini-3.8-flash"
 
-# Сколько раз максимум повторять Gemini при временной ошибке.
+# Повторные попытки Gemini.
 GEMINI_RETRIES = 2
 
-# Если Gemini получил 429 — не пытаться снова каждый цикл.
-# После этого времени можно попробовать снова.
+# После 429 Gemini не трогаем некоторое время.
 GEMINI_COOLDOWN = 60 * 60
 
-# Сколько памяти держать.
+# Максимальный размер памяти.
 MAX_MEMORY_ITEMS = 500
 
-# Если RSS summary совсем короткий,
-# используем простой fallback-пост.
+# Минимальный размер RSS summary.
 MIN_RSS_SUMMARY_LENGTH = 30
 
-# Не отправлять слишком короткие Gemini-посты.
+# Минимальный размер поста.
 MIN_POST_LENGTH = 60
 
-# Не отправлять слишком длинные.
+# Максимальный размер поста.
 MAX_POST_LENGTH = 1500
 
 
@@ -203,9 +190,7 @@ def clean_text(text):
 
     text = re.sub(r"<[^>]+>", " ", text)
 
-    text = normalize_whitespace(text)
-
-    return text
+    return normalize_whitespace(text)
 
 
 def normalize_title(title):
@@ -231,11 +216,11 @@ def normalize_title(title):
 
 
 def title_words(title):
-    return set(
+    return {
         word
         for word in normalize_title(title).split()
         if len(word) >= 3
-    )
+    }
 
 
 def title_similarity(a, b):
@@ -253,13 +238,6 @@ def title_similarity(a, b):
     )
 
 
-def safe_int(value, default=0):
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
 # ============================================================
 # FC 27 FILTER
 # ============================================================
@@ -267,7 +245,6 @@ def safe_int(value, default=0):
 def is_fc27_title(title):
     low = title.lower()
 
-    # Старые игры отбрасываем.
     forbidden = [
         "fc 26",
         "fc26",
@@ -446,12 +423,10 @@ def memory_has_title(memory, title):
         if old_title == normalized:
             return True
 
-        similarity = title_similarity(
+        if title_similarity(
             title,
             old_title
-        )
-
-        if similarity >= 0.85:
+        ) >= 0.85:
             return True
 
     return False
@@ -515,15 +490,11 @@ def make_rss_url(query):
 
 def get_news():
     news = []
-
-    # Ключ используем для удаления полностью одинаковых ссылок.
     seen_links = set()
 
     for query in SEARCH_QUERIES:
 
-        print(
-            f"RSS SEARCH: {query}"
-        )
+        print(f"RSS SEARCH: {query}")
 
         try:
             rss_url = make_rss_url(query)
@@ -644,7 +615,6 @@ def calculate_priority(title):
         "ultimate team": 40,
 
         "pro player": 120,
-
         "pro players": 120,
     }
 
@@ -678,9 +648,9 @@ def deduplicate_news(news):
 
                 duplicate = True
 
-                # Если новая версия имеет больше текста,
-                # оставляем её.
-                if len(item.get("summary", "")) > len(
+                if len(
+                    item.get("summary", "")
+                ) > len(
                     existing.get("summary", "")
                 ):
                     existing["summary"] = item[
@@ -967,9 +937,7 @@ def extract_article_text(soup):
 def fetch_article(item):
 
     source_url = item["link"]
-
     rss_title = item["title"]
-
     rss_summary = item.get(
         "summary",
         ""
@@ -985,7 +953,6 @@ def fetch_article(item):
     )
 
     if real_url != source_url:
-
         print(
             f"REAL URL: {real_url}"
         )
@@ -1123,6 +1090,9 @@ def prepare_articles(news):
 
     results = []
 
+    # ВАЖНО:
+    # ThreadPoolExecutor импортирован
+    # в самом начале файла.
     workers = min(
         8,
         max(1, len(candidates))
@@ -1145,10 +1115,6 @@ def prepare_articles(news):
             future_map
         ):
 
-            original = future_map[
-                future
-            ]
-
             try:
 
                 article = future.result()
@@ -1165,7 +1131,7 @@ def prepare_articles(news):
                     f"{error}"
                 )
 
-    # Сохраняем порядок по приоритету.
+    # Возвращаем статьи в порядке приоритета.
     results.sort(
         key=lambda x: (
             -x.get("priority", 0)
@@ -1268,6 +1234,7 @@ def build_gemini_prompt(
     memory_text = "\n".join(
         memory_text
     )
+
 
     prompt = f"""
 Ты главный редактор Telegram-канала LilsNews
@@ -1428,7 +1395,6 @@ def call_gemini(
                     "Gemini 429 RESOURCE_EXHAUSTED"
                 )
 
-                # Не долбим API каждые 10 минут.
                 gemini_cooldown_until = (
                     time.time()
                     + GEMINI_COOLDOWN
@@ -1579,10 +1545,6 @@ def parse_gemini_posts(result):
     if result.upper() == "NO_NEWS":
         return []
 
-    # --------------------------------------------------------
-    # Ищем блоки POST.
-    # --------------------------------------------------------
-
     pattern = re.compile(
         r"===\s*POST\s*\d+\s*===\s*(.*?)(?="
         r"===\s*POST\s*\d+\s*===|$)",
@@ -1601,18 +1563,11 @@ def parse_gemini_posts(result):
 
             block = block.strip()
 
-            if not block:
-                continue
-
-            posts.append(
-                block
-            )
+            if block:
+                posts.append(block)
 
     else:
 
-        # Gemini иногда может забыть маркеры.
-        # В таком случае считаем весь ответ
-        # одним постом.
         posts = [result]
 
 
@@ -1627,7 +1582,7 @@ def parse_gemini_posts(result):
         if not post:
             continue
 
-        # Удаляем возможный TOPIC.
+
         topic_match = re.search(
             r"TOPIC\s*:\s*(.+)",
             post,
@@ -1666,22 +1621,12 @@ def parse_gemini_posts(result):
             post_without_topic = post
 
 
-        post_without_topic = (
-            post_without_topic.strip()
-        )
-
-
-        if (
-            len(post_without_topic)
-            < MIN_POST_LENGTH
-        ):
+        if len(post_without_topic) < MIN_POST_LENGTH:
             continue
 
 
-        if (
-            len(post_without_topic)
-            > MAX_POST_LENGTH
-        ):
+        if len(post_without_topic) > MAX_POST_LENGTH:
+
             post_without_topic = (
                 post_without_topic[
                     :MAX_POST_LENGTH
@@ -1716,7 +1661,6 @@ def post_is_duplicate(
         return True
 
 
-    # Сравниваем с постами этого же цикла.
     for existing in current_posts:
 
         if title_similarity(
@@ -1737,7 +1681,6 @@ def post_is_duplicate(
         return False
 
 
-    # Проверяем последние публикации.
     for old in memory[-100:]:
 
         old_post = (
@@ -1776,7 +1719,7 @@ def post_is_duplicate(
 
 
 # ============================================================
-# FIND SOURCE FOR GENERATED POST
+# FIND SOURCE
 # ============================================================
 
 def find_best_source(
@@ -1785,7 +1728,6 @@ def find_best_source(
     articles
 ):
 
-    # Сначала ищем по словам topic.
     best = None
     best_score = -1
 
@@ -1793,12 +1735,7 @@ def find_best_source(
         topic
     )
 
-    post_words = set(
-        re.findall(
-            r"\w+",
-            post.lower()
-        )
-    )
+    post_lower = post.lower()
 
     for article in articles:
 
@@ -1816,12 +1753,9 @@ def find_best_source(
             & title_words_set
         ) * 10
 
-        # Дополнительно смотрим,
-        # встречаются ли слова заголовка
-        # в посте.
         for word in title_words_set:
 
-            if word in post.lower():
+            if word in post_lower:
                 score += 1
 
         if score > best_score:
@@ -1833,7 +1767,7 @@ def find_best_source(
 
 
 # ============================================================
-# RSS FALLBACK POSTS
+# RSS FALLBACK
 # ============================================================
 
 def category_for_title(title):
@@ -1901,11 +1835,7 @@ def make_fallback_post(article):
         )
     )
 
-    if not title:
-        return None
-
-
-    if not summary:
+    if not title or not summary:
         return None
 
 
@@ -1913,7 +1843,6 @@ def make_fallback_post(article):
         title
     )
 
-    # Убираем возможный мусор Google.
     summary = re.sub(
         r"\s*-\s*[A-Z][A-Za-z0-9 .'-]+$",
         "",
@@ -1939,7 +1868,6 @@ def make_fallback_post(article):
 
 
     if len(post) < MIN_POST_LENGTH:
-
         return None
 
 
@@ -1962,7 +1890,6 @@ def choose_articles_for_gemini(
 
     for article in articles:
 
-        # Если материал совсем пустой — пропускаем.
         if len(
             article.get("text", "")
         ) < 40:
@@ -1993,6 +1920,7 @@ def publish_gemini_posts(
     )
 
     if not posts:
+
         print(
             "Gemini produced no usable posts."
         )
@@ -2001,7 +1929,6 @@ def publish_gemini_posts(
 
 
     published_count = 0
-
     current_posts = []
 
 
@@ -2084,8 +2011,6 @@ def publish_gemini_posts(
 
         published_count += 1
 
-        # Маленькая пауза между сообщениями,
-        # чтобы Telegram не получил резкий burst.
         time.sleep(1)
 
 
@@ -2105,10 +2030,7 @@ def publish_fallback(
 
     for article in articles:
 
-        if (
-            published
-            >= MAX_POSTS_PER_CYCLE
-        ):
+        if published >= MAX_POSTS_PER_CYCLE:
             break
 
 
@@ -2145,13 +2067,8 @@ def publish_fallback(
             continue
 
 
-        post = generated[
-            "post"
-        ]
-
-        topic = generated[
-            "topic"
-        ]
+        post = generated["post"]
+        topic = generated["topic"]
 
 
         if post_is_duplicate(
@@ -2212,7 +2129,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 1. Get RSS
+    # 1. RSS
     # --------------------------------------------------------
 
     raw_news = get_news()
@@ -2227,7 +2144,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 2. Remove already published
+    # 2. FILTER
     # --------------------------------------------------------
 
     fresh_news = select_fresh_news(
@@ -2250,10 +2167,6 @@ def run_cycle(memory):
         return memory
 
 
-    # --------------------------------------------------------
-    # Print candidates
-    # --------------------------------------------------------
-
     print("--------------------------------")
 
     for index, item in enumerate(
@@ -2269,7 +2182,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 3. Fetch articles
+    # 3. FETCH
     # --------------------------------------------------------
 
     articles = prepare_articles(
@@ -2287,7 +2200,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 4. Gemini
+    # 4. GEMINI
     # --------------------------------------------------------
 
     gemini_articles = (
@@ -2314,7 +2227,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 5. Gemini unavailable
+    # 5. GEMINI UNAVAILABLE
     # --------------------------------------------------------
 
     if result is None:
@@ -2347,7 +2260,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 6. Gemini says no news
+    # 6. NO NEWS
     # --------------------------------------------------------
 
     if (
@@ -2363,7 +2276,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 7. Publish multiple posts
+    # 7. PUBLISH
     # --------------------------------------------------------
 
     memory, published_count = (
@@ -2376,7 +2289,7 @@ def run_cycle(memory):
 
 
     # --------------------------------------------------------
-    # 8. Save memory
+    # 8. SAVE
     # --------------------------------------------------------
 
     save_memory(
@@ -2433,6 +2346,7 @@ def validate_config():
         or GEMINI_API_KEY
         == "PUT_NEW_GEMINI_API_KEY_HERE"
     ):
+
         print(
             "WARNING: Gemini API key "
             "is not configured."
@@ -2488,7 +2402,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Config
+    # CONFIG
     # --------------------------------------------------------
 
     if not validate_config():
@@ -2501,7 +2415,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Memory
+    # MEMORY
     # --------------------------------------------------------
 
     memory = load_memory()
@@ -2513,7 +2427,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Telegram
+    # TELEGRAM
     # --------------------------------------------------------
 
     if not test_telegram():
@@ -2530,7 +2444,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # Main loop
+    # MAIN LOOP
     # --------------------------------------------------------
 
     while True:
