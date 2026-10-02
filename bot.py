@@ -3,12 +3,12 @@ import json
 import time
 import re
 import html
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote_plus, urlparse
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
-from google import genai
 
 # ============================================================
 # LILSNEWS — EA SPORTS FC 27 TELEGRAM NEWS BOT
@@ -34,12 +34,13 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 MEMORY_FILE = "published_news.json"
-CHECK_INTERVAL = 10 * 60          # 10 minutes
-MAX_RSS_ITEMS_PER_QUERY = 12
-MAX_CANDIDATES = 20
-MAX_ARTICLE_CHARS = 16000
-
-client = genai.Client(api_key=GEMINI_API_KEY)
+CHECK_INTERVAL = 10 * 60
+MAX_RSS_ITEMS_PER_QUERY = 8
+MAX_CANDIDATES = 10
+MAX_ARTICLES_TO_FETCH = 6
+MAX_ARTICLE_CHARS = 10000
+ARTICLE_TIMEOUT = 8
+GEMINI_MODEL = "gemini-3.8-flash"
 
 HEADERS = {
     "User-Agent": (
@@ -89,11 +90,16 @@ def send_telegram(message):
 
 def test_telegram():
     try:
-        send_telegram("🤖 LilsNews запущен.\n\nМониторинг EA FC 27 активен.")
-        print("Telegram test message sent successfully.")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram API error: {data}")
+        print("Telegram connection OK (no test message sent).")
         return True
     except Exception as error:
-        print(f"Telegram test failed: {error}")
+        print(f"Telegram connection failed: {error}")
         return False
 
 
@@ -429,7 +435,7 @@ def fetch_article(item):
         response = requests.get(
             real_url,
             headers=HEADERS,
-            timeout=25,
+            timeout=ARTICLE_TIMEOUT,
             allow_redirects=True,
         )
 
@@ -494,35 +500,24 @@ def fetch_article(item):
 
 
 def prepare_articles(news):
-    prepared = []
-
-    for i, item in enumerate(news, 1):
-        print("--------------------------------")
-        print(
-            f"Reading article {i}/{len(news)}: "
-            f"{item['title']}"
-        )
-
-        article = fetch_article(item)
-
-        if article:
-            prepared.append({
-                "title": article["title"],
-                "url": article["url"],
-                "text": article["text"],
-                "priority": article["priority"],
-                "source_type": article["source_type"],
-            })
-            print(
-                "Article prepared "
-                f"({article['source_type']})."
-            )
-        else:
-            print("Could not prepare article.")
-
+    candidates = news[:MAX_ARTICLES_TO_FETCH]
+    print(f"Preparing {len(candidates)} top candidates in parallel...")
+    results = []
+    with ThreadPoolExecutor(max_workers=max(1, len(candidates))) as executor:
+        futures = [executor.submit(fetch_article, item) for item in candidates]
+        for future in as_completed(futures):
+            try:
+                article = future.result()
+            except Exception as error:
+                print(f"Article worker failed: {error}")
+                continue
+            if article:
+                results.append(article)
+    priority_map = {item["title"]: i for i, item in enumerate(news)}
+    results.sort(key=lambda x: priority_map.get(x["title"], 9999))
     print("--------------------------------")
-    print(f"Prepared {len(prepared)} usable news items")
-    return prepared
+    print(f"Prepared {len(results)} usable news items")
+    return results
 
 
 # ============================================================
@@ -532,129 +527,57 @@ def prepare_articles(news):
 def analyze_news(articles, memory):
     if not articles:
         return None
+    articles_text = "\n".join(
+        f"===== МАТЕРИАЛ {i} =====\nЗАГОЛОВОК: {a['title']}\nТИП: {a['source_type']}\nURL: {a['url']}\nТЕКСТ:\n{a['text']}"
+        for i, a in enumerate(articles, 1)
+    )
+    memory_text = "\n".join(
+        f"TOPIC: {x.get('topic','')}\nTITLE: {x.get('title','')}"
+        for x in memory[-80:]
+    )
+    prompt = f"""Ты главный редактор Telegram-канала LilsNews по EA SPORTS FC 27.
 
-    articles_text_parts = []
+Выбери максимум ОДНУ реально новую и конкретную новость, полезную игрокам EA SPORTS FC 27 Ultimate Team.
 
-    for i, article in enumerate(articles, 1):
-        articles_text_parts.append(
-            f"""
-===== МАТЕРИАЛ {i} =====
-ЗАГОЛОВОК: {article['title']}
-ТИП ИСТОЧНИКА: {article['source_type']}
-URL: {article['url']}
-ТЕКСТ:
-{article['text']}
-"""
-        )
+ПРАВИЛА:
+- Используй только данные из материалов.
+- Ничего не придумывай: игроков, OVR, цены, даты, SBC, тактики, META и т.д.
+- Не публикуй то, что уже есть в памяти.
+- Если нет конкретной новой новости — ответь ровно NO_NEWS.
+- Не показывай источник и не добавляй ссылку.
+- Пост 40–90 слов, без воды.
+- Формат: 📰 LILSNEWS, категория (🔥 META / 🃏 SBC / ⚠️ СЛУХ / 🎮 GAMEPLAY / 🛠 ПАТЧ / 🟣 PROMO), короткий заголовок и конкретика.
+- Последняя строка обязательно: TOPIC: уникальное название события.
 
-    articles_text = "\n".join(articles_text_parts)
-
-    memory_text_parts = []
-
-    for item in memory[-80:]:
-        memory_text_parts.append(
-            f"TOPIC: {item.get('topic', '')}\n"
-            f"TITLE: {item.get('title', '')}\n"
-        )
-
-    memory_text = "\n".join(memory_text_parts)
-
-    prompt = f"""
-Ты главный редактор Telegram-канала LilsNews по EA SPORTS FC 27.
-
-Твоя задача — выбрать максимум ОДНУ реально новую и конкретную
-новость, которая полезна игрокам EA SPORTS FC 27 Ultimate Team.
-
-СТРОГИЕ ПРАВИЛА:
-
-1. Используй ТОЛЬКО информацию из материалов ниже.
-2. НИЧЕГО не придумывай.
-3. Не придумывай игроков, рейтинги, цены, SBC, характеристики,
-   даты, награды, тактики или условия апгрейда.
-4. Если материал является RSS fallback, у тебя могут быть только
-   заголовок и короткое описание. В таком случае используй только
-   те факты, которые прямо написаны там.
-5. Не превращай старую новость в новую.
-6. Не повторяй темы из памяти.
-7. Приоритет:
-   - SBC / конкретные карты
-   - META / тактика / формации
-   - pro players
-   - gameplay
-   - patch / update
-   - promo
-   - leaks с конкретными данными
-   - objectives
-   - evolutions
-8. Если достойной новой конкретной новости нет — ответь строго:
-   NO_NEWS
-
-ФОРМАТ ОТВЕТА:
-
-POST:
-📰 LILSNEWS
-
-[КАТЕГОРИЯ]
-
-[КОРОТКИЙ ЗАГОЛОВОК]
-
-[КОНКРЕТНЫЕ ДАННЫЕ]
-
-TOPIC: уникальная тема новости
-
-Пиши на русском.
-Пост должен быть коротким и удобным для Telegram.
-Не добавляй вступление от себя.
-
-ПАМЯТЬ УЖЕ ОПУБЛИКОВАННЫХ ТЕМ:
+УЖЕ ОПУБЛИКОВАНО:
 {memory_text}
 
-МАТЕРИАЛЫ:
+НОВЫЕ МАТЕРИАЛЫ:
 {articles_text}
-"""
 
-    models = [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
-    ]
-
-    for model in models:
-        for attempt in range(2):
-            try:
-                print(
-                    f"Trying Gemini model: {model}, "
-                    f"attempt: {attempt + 1}"
-                )
-
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                )
-
-                if response and response.text:
-                    result = response.text.strip()
-
-                    print("================================")
-                    print("GEMINI RAW RESPONSE:")
-                    print(result)
-                    print("================================")
-
-                    return result
-
-            except Exception as error:
-                print(
-                    f"Gemini error ({model}): {error}"
-                )
-                if attempt == 0:
-                    time.sleep(5)
-
-    return None
-
-
-# ============================================================
-# OUTPUT PARSING
-# ============================================================
+Ответь только готовым постом или NO_NEWS."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 500}}
+    try:
+        print(f"Calling Gemini: {GEMINI_MODEL}")
+        response = requests.post(url, headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}, json=payload, timeout=45)
+        print(f"Gemini HTTP status: {response.status_code}")
+        response.raise_for_status()
+        data = response.json()
+        parts = []
+        for candidate in data.get("candidates", []):
+            for part in candidate.get("content", {}).get("parts", []):
+                if part.get("text"):
+                    parts.append(part["text"])
+        result = "\n".join(parts).strip()
+        if not result:
+            print(f"Gemini returned no text: {data}")
+            return None
+        print("Gemini response received.")
+        return result
+    except Exception as error:
+        print(f"Gemini error: {error}")
+        return None
 
 def extract_topic(result):
     if not result:
