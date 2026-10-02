@@ -2,9 +2,10 @@ import os
 import json
 import time
 import re
+import html
 import requests
 import feedparser
-from bs4 import BeautifulSoup
+from urllib.parse import quote
 from google import genai
 
 
@@ -29,40 +30,28 @@ client = genai.Client(
 
 RSS_FEEDS = [
 
-    # SBC
     "https://news.google.com/rss/search?q=EA%20FC%2027%20SBC&hl=en-US&gl=US&ceid=US:en",
 
-    # Cards
     "https://news.google.com/rss/search?q=EA%20FC%2027%20Ultimate%20Team%20cards&hl=en-US&gl=US&ceid=US:en",
 
-    # Players / leaks
     "https://news.google.com/rss/search?q=EA%20FC%2027%20players%20leaked&hl=en-US&gl=US&ceid=US:en",
 
-    # Ratings
     "https://news.google.com/rss/search?q=EA%20FC%2027%20ratings&hl=en-US&gl=US&ceid=US:en",
 
-    # Promo
     "https://news.google.com/rss/search?q=EA%20FC%2027%20promo&hl=en-US&gl=US&ceid=US:en",
 
-    # Meta
     "https://news.google.com/rss/search?q=EA%20FC%2027%20meta&hl=en-US&gl=US&ceid=US:en",
 
-    # Tactics
     "https://news.google.com/rss/search?q=EA%20FC%2027%20tactics&hl=en-US&gl=US&ceid=US:en",
 
-    # Gameplay
     "https://news.google.com/rss/search?q=EA%20FC%2027%20gameplay&hl=en-US&gl=US&ceid=US:en",
 
-    # Patch
     "https://news.google.com/rss/search?q=EA%20FC%2027%20patch&hl=en-US&gl=US&ceid=US:en",
 
-    # Objectives
     "https://news.google.com/rss/search?q=EA%20FC%2027%20Objectives&hl=en-US&gl=US&ceid=US:en",
 
-    # Evolutions
     "https://news.google.com/rss/search?q=EA%20FC%2027%20Evolution&hl=en-US&gl=US&ceid=US:en",
 
-    # Pro players
     "https://news.google.com/rss/search?q=EA%20FC%2027%20pro%20players&hl=en-US&gl=US&ceid=US:en",
 ]
 
@@ -141,13 +130,54 @@ def save_memory(memory):
 
 
 # ============================================================
+# ОЧИСТКА HTML
+# ============================================================
+
+def clean_html(text):
+
+    if not text:
+        return ""
+
+    text = html.unescape(text)
+
+    text = re.sub(
+        r"<script.*?</script>",
+        " ",
+        text,
+        flags=re.I | re.S
+    )
+
+    text = re.sub(
+        r"<style.*?</style>",
+        " ",
+        text,
+        flags=re.I | re.S
+    )
+
+    text = re.sub(
+        r"<[^>]+>",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
 # ПОЛУЧЕНИЕ НОВОСТЕЙ
 # ============================================================
 
 def get_news():
 
     news = []
-    seen = set()
+    seen_links = set()
+    seen_titles = set()
 
     for feed_url in RSS_FEEDS:
 
@@ -157,7 +187,7 @@ def get_news():
                 feed_url
             )
 
-            for entry in feed.entries[:10]:
+            for entry in feed.entries[:12]:
 
                 title = entry.get(
                     "title",
@@ -169,22 +199,34 @@ def get_news():
                     ""
                 ).strip()
 
+                description = entry.get(
+                    "summary",
+                    ""
+                )
+
+                description = clean_html(
+                    description
+                )
+
                 if not title or not link:
                     continue
 
                 title_lower = title.lower()
 
-                # Не берём старые игры
-                if "fc 26" in title_lower:
-                    continue
+                # Старые игры не нужны
+                old_game_words = [
+                    "fc 26",
+                    "fc26",
+                    "fc 25",
+                    "fc25",
+                    "fifa 25",
+                    "fifa 26"
+                ]
 
-                if "fc26" in title_lower:
-                    continue
-
-                if "fc 25" in title_lower:
-                    continue
-
-                if "fc25" in title_lower:
+                if any(
+                    word in title_lower
+                    for word in old_game_words
+                ):
                     continue
 
                 # Только FC27
@@ -194,14 +236,25 @@ def get_news():
                 ):
                     continue
 
-                if link in seen:
+                title_key = re.sub(
+                    r"[^a-z0-9а-яё]",
+                    "",
+                    title_lower
+                )
+
+                if link in seen_links:
                     continue
 
-                seen.add(link)
+                if title_key in seen_titles:
+                    continue
+
+                seen_links.add(link)
+                seen_titles.add(title_key)
 
                 news.append({
                     "title": title,
                     "link": link,
+                    "description": description,
                 })
 
         except Exception as error:
@@ -217,98 +270,106 @@ def get_news():
 # ПРИОРИТЕТ
 # ============================================================
 
-def calculate_priority(title):
+def calculate_priority(title, description=""):
 
-    title = title.lower()
+    text = (
+        title + " " + description
+    ).lower()
 
     score = 0
 
-    # SBC
-    if "sbc" in title:
+    # Самые важные категории
+    if "sbc" in text:
+        score += 150
+
+    if "meta" in text:
+        score += 140
+
+    if "tactic" in text:
+        score += 130
+
+    if "tactics" in text:
+        score += 130
+
+    if "formation" in text:
+        score += 120
+
+    if "custom tactics" in text:
+        score += 140
+
+    if "pro player" in text:
+        score += 120
+
+    if "pro players" in text:
+        score += 120
+
+    if "gameplay" in text:
         score += 100
 
-    if "new sbc" in title:
-        score += 30
+    if "patch" in text:
+        score += 110
 
-    # Cards
-    if "card" in title:
-        score += 70
-
-    if "cards" in title:
-        score += 70
-
-    # Players
-    if "player" in title:
+    if "update" in text:
         score += 60
 
-    if "players" in title:
-        score += 60
-
-    # Ratings
-    if "rating" in title:
-        score += 55
-
-    if "ratings" in title:
-        score += 55
-
-    # META
-    if "meta" in title:
-        score += 100
-
-    if "tactic" in title:
+    if "card" in text:
         score += 90
 
-    if "tactics" in title:
+    if "cards" in text:
         score += 90
 
-    if "formation" in title:
-        score += 85
+    if "player" in text:
+        score += 70
 
-    if "formations" in title:
-        score += 85
+    if "players" in text:
+        score += 70
 
-    if "gameplay" in title:
-        score += 75
+    if "leak" in text:
+        score += 70
 
-    if "pro player" in title:
-        score += 75
+    if "leaked" in text:
+        score += 70
 
-    if "pro players" in title:
-        score += 75
-
-    # Promo
-    if "promo" in title:
-        score += 60
-
-    if "team 2" in title:
-        score += 50
-
-    if "team 1" in title:
-        score += 50
-
-    # Leaks
-    if "leak" in title:
-        score += 45
-
-    if "leaked" in title:
-        score += 45
-
-    # Patch
-    if "patch" in title:
+    if "promo" in text:
         score += 80
 
-    if "update" in title:
+    if "objective" in text:
+        score += 90
+
+    if "evolution" in text:
+        score += 80
+
+    if "ratings" in text:
+        score += 70
+
+    if "rating" in text:
+        score += 70
+
+    if "upgrade" in text:
+        score += 70
+
+    # Конкретные признаки
+    if re.search(
+        r"\b\d{2}\s*ovr\b",
+        text
+    ):
         score += 40
 
-    # Objectives / Evolutions
-    if "objective" in title:
-        score += 60
-
-    if "evolution" in title:
-        score += 60
-
-    if "upgrade" in title:
+    if re.search(
+        r"\b4-\d-\d\b",
+        text
+    ):
         score += 50
+
+    if re.search(
+        r"\b\d-\d-\d-\d\b",
+        text
+    ):
+        score += 50
+
+    # YouTube
+    if "youtube.com" in text:
+        score += 20
 
     return score
 
@@ -322,7 +383,8 @@ def select_best_news(news):
     for item in news:
 
         item["priority"] = calculate_priority(
-            item["title"]
+            item["title"],
+            item["description"]
         )
 
     news.sort(
@@ -330,124 +392,237 @@ def select_best_news(news):
         reverse=True
     )
 
-    return news[:15]
+    # Только 8 лучших.
+    # Так Gemini не получает 15 огромных статей.
+    return news[:8]
 
 
 # ============================================================
-# ЧТЕНИЕ СТАТЬИ
+# ПОПЫТКА ПРОЧИТАТЬ СТРАНИЦУ
 # ============================================================
 
-def read_article(url):
+def fetch_page(url):
 
-    try:
+    user_agents = [
 
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/154.0 Safari/537.36"
-            )
-        }
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/154.0 Safari/537.36",
 
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=20
-        )
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/153.0 Safari/537.36"
+    ]
 
-        response.raise_for_status()
+    for user_agent in user_agents:
 
-        html = response.text
+        try:
 
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
-
-        # Убираем мусор
-        for tag in soup(
-            [
-                "script",
-                "style",
-                "nav",
-                "footer",
-                "header",
-                "aside",
-                "form",
-                "noscript"
-            ]
-        ):
-
-            tag.decompose()
-
-        # Сначала ищем article
-        article = soup.find(
-            "article"
-        )
-
-        if article:
-
-            text = article.get_text(
-                "\n",
-                strip=True
+            response = requests.get(
+                url,
+                headers={
+                    "User-Agent": user_agent,
+                    "Accept": (
+                        "text/html,"
+                        "application/xhtml+xml,"
+                        "application/xml;q=0.9,"
+                        "*/*;q=0.8"
+                    ),
+                    "Accept-Language":
+                        "en-US,en;q=0.9",
+                },
+                timeout=15,
+                allow_redirects=True
             )
 
-        else:
+            if response.status_code != 200:
+                continue
 
-            text = soup.get_text(
-                "\n",
-                strip=True
-            )
+            content = response.text
 
-        # Чистим пустые строки
-        lines = []
+            if len(content) < 1000:
+                continue
 
-        for line in text.splitlines():
+            return content
 
-            line = re.sub(
-                r"\s+",
-                " ",
-                line
-            ).strip()
-
-            if line:
-                lines.append(line)
-
-        text = "\n".join(lines)
-
-        # Ограничиваем размер
-        # чтобы не отправлять Gemini огромную страницу
-        if len(text) > 18000:
-            text = text[:18000]
-
-        if len(text) < 300:
+        except Exception as error:
 
             print(
-                "Article text too short."
+                f"Page request error: {error}"
             )
 
-            return ""
-
-        return text
-
-    except Exception as error:
-
-        print(
-            f"Article read error: {error}"
-        )
-
-        return ""
+    return ""
 
 
 # ============================================================
-# ДОБАВЛЯЕМ ТЕКСТ СТАТЕЙ
+# ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ HTML
+# ============================================================
+
+def extract_text_from_html(content):
+
+    if not content:
+        return ""
+
+    # Удаляем скрипты / стили / SVG
+    content = re.sub(
+        r"<script.*?</script>",
+        " ",
+        content,
+        flags=re.I | re.S
+    )
+
+    content = re.sub(
+        r"<style.*?</style>",
+        " ",
+        content,
+        flags=re.I | re.S
+    )
+
+    content = re.sub(
+        r"<svg.*?</svg>",
+        " ",
+        content,
+        flags=re.I | re.S
+    )
+
+    # Сохраняем разделители
+    content = re.sub(
+        r"</(p|div|article|section|li|h1|h2|h3|h4|br)>",
+        "\n",
+        content,
+        flags=re.I
+    )
+
+    # Удаляем остальные HTML-теги
+    content = re.sub(
+        r"<[^>]+>",
+        " ",
+        content
+    )
+
+    content = html.unescape(
+        content
+    )
+
+    lines = []
+
+    for line in content.splitlines():
+
+        line = re.sub(
+            r"\s+",
+            " ",
+            line
+        ).strip()
+
+        if len(line) >= 3:
+            lines.append(line)
+
+    text = "\n".join(
+        lines
+    )
+
+    # Убираем типичный мусор
+    junk_patterns = [
+        r"cookie",
+        r"privacy policy",
+        r"sign up",
+        r"subscribe",
+        r"advertisement",
+        r"all rights reserved",
+    ]
+
+    cleaned = []
+
+    for line in text.splitlines():
+
+        low = line.lower()
+
+        if len(line) < 3:
+            continue
+
+        # Не удаляем строку только из-за одного слова,
+        # иначе можно случайно потерять важную информацию.
+        if len(line) < 80 and any(
+            pattern in low
+            for pattern in junk_patterns
+        ):
+            continue
+
+        cleaned.append(
+            line
+        )
+
+    text = "\n".join(
+        cleaned
+    )
+
+    # Ограничение
+    if len(text) > 14000:
+        text = text[:14000]
+
+    return text.strip()
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ КОНТЕНТА
+# ============================================================
+
+def get_article_content(item):
+
+    # 1. Сначала RSS description
+    rss_text = clean_html(
+        item.get(
+            "description",
+            ""
+        )
+    )
+
+    # Если RSS уже содержит полезный текст,
+    # сохраняем его.
+    if len(rss_text) >= 150:
+
+        base_text = rss_text
+
+    else:
+
+        base_text = ""
+
+    # 2. Пробуем открыть страницу
+    page = fetch_page(
+        item["link"]
+    )
+
+    if page:
+
+        page_text = extract_text_from_html(
+            page
+        )
+
+        if len(page_text) > len(base_text):
+
+            base_text = page_text
+
+    # 3. Если статья не открылась,
+    # используем хотя бы RSS.
+    if len(base_text) < 80:
+
+        base_text = (
+            "Текст статьи недоступен. "
+            "Используй только заголовок "
+            "и RSS-описание, не выдумывай "
+            "детали."
+        )
+
+    return base_text
+
+
+# ============================================================
+# ОБОГАЩЕНИЕ НОВОСТЕЙ
 # ============================================================
 
 def enrich_news(news):
 
-    enriched = []
+    result = []
 
     for i, item in enumerate(
         news,
@@ -460,28 +635,24 @@ def enrich_news(news):
             f"{item['title']}"
         )
 
-        article_text = read_article(
-            item["link"]
-        )
-
-        if not article_text:
-
-            print(
-                "Could not read article."
-            )
-
-            continue
-
-        item["content"] = article_text
-
-        enriched.append(
+        content = get_article_content(
             item
         )
 
-        # Небольшая пауза
+        item["content"] = content
+
+        print(
+            f"Content length: "
+            f"{len(content)} characters"
+        )
+
+        result.append(
+            item
+        )
+
         time.sleep(1)
 
-    return enriched
+    return result
 
 
 # ============================================================
@@ -515,7 +686,7 @@ def analyze_news(
 ПРИОРИТЕТ:
 {item["priority"]}
 
-СОДЕРЖАНИЕ СТАТЬИ:
+ТЕКСТ / ОПИСАНИЕ:
 {item["content"]}
 
 ==============================
@@ -534,54 +705,45 @@ def analyze_news(
 ПОСТ:
 {item.get("post", "")}
 
-==============================
 """
 
 
     prompt = f"""
-Ты главный редактор Telegram-канала LilsNews
-по EA SPORTS FC 27.
+Ты редактор Telegram-канала LilsNews
+по EA SPORTS FC 27 Ultimate Team.
 
-Твоя задача — находить НЕ просто новости,
-а конкретную информацию, которая реально
-интересна игроку Ultimate Team.
+Твоя задача — находить самые полезные,
+конкретные и свежие новости для игроков.
 
-Теперь у тебя есть НЕ ТОЛЬКО заголовки,
-но и содержимое статей.
-
-ОБЯЗАТЕЛЬНО анализируй содержание статьи.
+НЕ ПИШИ ПУСТЫЕ НОВОСТИ.
 
 ==================================================
-ПРИОРИТЕТ
+ЧТО НАМ НУЖНО
 ==================================================
-
-🔥 SBC
-
-🔥 НОВЫЕ КАРТЫ
-
-🔥 КОНКРЕТНЫЕ ИГРОКИ
-
-🔥 OVR / РЕЙТИНГИ
 
 🔥 META
 
-🔥 ТАКТИКИ
+🎮 TAKTICS
 
-🔥 ФОРМАЦИИ
+🧠 CUSTOM TACTICS
 
-🔥 ТАКТИКИ ПРО-ИГРОКОВ
+🃏 SBC
 
-🔥 GAMEPLAY
+⭐ НОВЫЕ КАРТЫ
 
-🔥 PATCH
+👤 META PLAYERS
 
-🔥 PROMO
+⚡ GAMEPLAY
 
-🔥 LEAKS
+🛠 PATCH
 
-🔥 OBJECTIVES
+🟣 PROMO
 
-🔥 EVOLUTIONS
+⚠️ LEAKS
+
+🎯 OBJECTIVES
+
+🔄 EVOLUTIONS
 
 ==================================================
 ГЛАВНОЕ ПРАВИЛО
@@ -589,97 +751,117 @@ def analyze_news(
 
 НЕ ПЕРЕСКАЗЫВАЙ ЗАГОЛОВОК.
 
-ТЫ ДОЛЖЕН ДОСТАТЬ ИЗ СТАТЬИ
-КОНКРЕТНЫЕ ДАННЫЕ.
-
-Например, если статья называется:
+Если статья:
 
 "EA FC 27 Best Meta Tactics"
 
-НЕ ПИШИ:
+нельзя писать:
 
-"Появились новые мета-тактики."
+"Появились лучшие мета-тактики."
 
 Это бесполезно.
 
-Вместо этого найди в статье:
+Нужно найти КОНКРЕТИКУ.
 
-• формацию
-• настройки
-• роли
-• инструкции
-• стиль игры
-• игроков
-• причины эффективности
-• информацию о про-игроках
+Например:
 
-И напиши конкретно то,
-что реально указано в статье.
+🔥 4-4-2
+
+• какая роль у нападающих
+• какая роль у полузащитников
+• defensive approach
+• build-up style
+• width
+• depth
+• конкретные player instructions
+• конкретный про-игрок
+
+Но только если это действительно
+есть в предоставленном материале.
 
 ==================================================
-META / ТАКТИКИ
+META / TAKTICS
 ==================================================
 
-Если статья содержит META,
-ищи:
+Если материал про тактики:
+
+ОБЯЗАТЕЛЬНО ищи:
 
 • Formation
 • Custom Tactics
-• Player Roles
-• Player Instructions
-• Build Up Style
+• Roles
+• Instructions
+• Build Up
 • Defensive Approach
 • Width
 • Depth
-• Attacking Style
 • конкретных игроков
-• конкретных про-игроков
-• PlayStyles
-• Gameplay mechanics
+• имена про-игроков
 
-Если есть конкретная схема:
+Если в статье есть:
 
-например:
+"4-4-2"
 
-4-4-2
+покажи:
 
-обязательно покажи её.
+"4-4-2"
 
 Если есть конкретные настройки —
 покажи их.
 
-Если есть про-игрок —
-укажи его имя.
+Если настроек нет —
+НЕ ВЫДУМЫВАЙ.
 
-Если статья говорит,
-что определённый игрок использует эту тактику —
-укажи это.
+Если статья только говорит,
+что "4-4-2 сильная",
+но не даёт полезной информации,
+лучше NO_NEWS.
 
-НЕ ПРИДУМЫВАЙ отсутствующие настройки.
+==================================================
+PRO PLAYERS
+==================================================
+
+Если упоминается:
+
+Anders Vejrgang
+или другой про-игрок,
+
+покажи:
+
+👤 Имя
+
+🎮 Что именно он использует.
+
+Например:
+
+4-4-2
+
+или конкретные Custom Tactics.
+
+НЕ ПРИДУМЫВАЙ связь,
+если её нет в материале.
 
 ==================================================
 SBC
 ==================================================
 
-Если найден новый SBC,
-ищи в статье:
+Для SBC ищи:
 
 🃏 Игрок
 ⭐ OVR
 📍 Позиция
 💰 Цена
 📋 Требования
-⏳ Срок
 🎁 Награды
+⏳ Срок
 
-Показывай только те данные,
-которые реально есть.
+Показывай только известные данные.
 
 ==================================================
 КАРТЫ
 ==================================================
 
-Если найдена новая карта:
+Если есть новая карта:
 
 🃏 Игрок
 ⭐ OVR
@@ -687,41 +869,38 @@ SBC
 ⚡ Pace
 🎯 Shooting
 🎮 PlayStyles
-🔥 ключевые характеристики
+🔥 главные характеристики
 
-Но только если данные присутствуют.
+Только реальные данные
+из материала.
 
 ==================================================
-LEAK
+LEAKS
 ==================================================
 
-Если это слух:
+Если это слив:
 
 ⚠️ СЛУХ
 
-Но обязательно показывай конкретику.
+Но обязательно нужна конкретика.
 
 Например:
 
+🟣 Mbappé — 92 OVR
 🟣 Haaland — 91 OVR
-🟣 Diani — 88 OVR
-🟣 Upamecano — 88 OVR
 
-Если статья называет только промо,
-но не называет игроков —
-НЕ ПРИДУМЫВАЙ игроков.
+Если игроков в материале нет,
+НЕ ПРИДУМЫВАЙ их.
 
 ==================================================
-ПАТЧ
+PATCH
 ==================================================
 
 Если это патч:
 
 🛠 ПАТЧ
 
-Покажи конкретные изменения.
-
-Например:
+Покажи именно изменения:
 
 • Passing
 • Shooting
@@ -729,9 +908,10 @@ LEAK
 • Dribbling
 • Goalkeepers
 • Ultimate Team
+• Career Mode
 
-Но только если это действительно
-есть в тексте статьи.
+Но только если это написано
+в материале.
 
 ==================================================
 ДЕДУПЛИКАЦИЯ
@@ -739,138 +919,104 @@ LEAK
 
 Очень важно.
 
-Уже была:
+Если уже публиковалось:
 
-"Destined for Glory Team 2 leaked."
+"Destined for Glory Team 2 leaked"
 
-Новая статья:
+а новый материал рассказывает
+то же самое,
 
-"More information about Destined for Glory Team 2."
+НЕ ПУБЛИКУЙ.
 
-НЕ публиковать.
+Но если новый материал содержит
+НОВУЮ конкретную информацию:
 
-Но если новая статья добавляет:
-
-• новых игроков
+• новый игрок
 • OVR
-• цены
 • SBC
-• Objectives
-• новые характеристики
-• новые даты
-• новые апгрейды
+• Objective
+• цена
+• новая карта
+• новая дата
+• новый upgrade path
 
-то это уже новая информация.
-
-В таком случае можно публиковать.
+тогда это может быть отдельная новость.
 
 ==================================================
-КАЧЕСТВО
+КЛЮЧЕВОЕ ПРАВИЛО КАЧЕСТВА
 ==================================================
 
-Публикуй ТОЛЬКО если в статье
-есть конкретная новая информация.
+Лучше НЕ опубликовать новость,
+чем опубликовать воду.
 
-Если статья просто:
-
-• обзор
-• мнение
-• список старых игроков
-• старый гайд
-• общие советы
-• повторение уже известной информации
-
-ответь:
+Если нет конкретной полезной информации:
 
 NO_NEWS
 
 ==================================================
-НЕ ВЫДУМЫВАЙ
+СТИЛЬ ПОСТА
 ==================================================
 
-НИКОГДА не придумывай:
-
-❌ игроков
-❌ OVR
-❌ цены
-❌ SBC
-❌ тактики
-❌ формации
-❌ настройки
-❌ даты
-❌ характеристики
-❌ META
-
-Если этого нет в статье —
-не пиши это.
-
-==================================================
-СТИЛЬ
-==================================================
-
-Пост должен быть коротким.
-
-Обычно:
+Пост:
 
 40–90 слов.
 
-Но если есть реально много важной
-конкретики — можно немного больше.
+Можно до 120,
+если информации действительно много.
 
-Никакой воды.
+Без воды.
 
-Никаких длинных вступлений.
+Без длинных вступлений.
 
-Никаких:
+Сразу конкретика.
 
-"В мире EA FC 27 произошло..."
+Не используй:
+
+"Фанаты с нетерпением ждут..."
 
 "Игроки получили возможность..."
 
-"Фанаты игры с нетерпением..."
-
-Сразу к сути.
+"В мире EA FC 27..."
 
 ==================================================
 ФОРМАТ
 ==================================================
 
-Используй:
-
 📰 LILSNEWS
-
-Затем категория:
 
 🔥 META
 
+или
+
 🃏 SBC
 
-⚠️ СЛУХ
+или
 
 🎮 GAMEPLAY
 
+или
+
 🛠 ПАТЧ
+
+или
+
+⚠️ СЛУХ
+
+или
 
 🟣 PROMO
 
-Затем короткий заголовок.
+Затем:
 
-Затем конкретика.
+Короткий конкретный заголовок
 
-Не добавляй источник.
+Затем:
 
-Не добавляй ссылку.
+самая важная информация.
 
-==================================================
-ВАЖНО
-==================================================
+НЕ добавляй источник.
 
-Если информация полезная,
-но статья содержит недостаточно конкретики,
-лучше НЕ публиковать.
-
-Лучше один действительно хороший пост,
-чем пять пустых.
+НЕ добавляй ссылку.
 
 ==================================================
 УЖЕ ОПУБЛИКОВАНО
@@ -888,19 +1034,16 @@ NO_NEWS
 ОТВЕТ
 ==================================================
 
-Если есть действительно новая
-и конкретная информация:
+Если есть ОДНА действительно важная
+и конкретная новость:
 
-напиши готовый пост.
+напиши только готовый Telegram-пост.
 
-В конце обязательно добавь:
+В конце обязательно:
 
 TOPIC: уникальное название новости
 
-Если ничего действительно нового
-и полезного нет:
-
-ответь строго:
+Если ничего достойного публикации нет:
 
 NO_NEWS
 """
@@ -927,7 +1070,10 @@ NO_NEWS
                     contents=prompt
                 )
 
-                if response and response.text:
+                if (
+                    response
+                    and response.text
+                ):
 
                     return response.text.strip()
 
@@ -945,15 +1091,16 @@ NO_NEWS
 
 
 # ============================================================
-# ИЗВЛЕЧЕНИЕ TOPIC
+# TOPIC
 # ============================================================
 
 def extract_topic(result):
 
+    topic = ""
+
     lines = result.splitlines()
 
     post_lines = []
-    topic = ""
 
     for line in lines:
 
@@ -980,7 +1127,7 @@ def extract_topic(result):
 
 
 # ============================================================
-# ПРОВЕРКА ДУБЛЯ
+# ДЕДУПЛИКАЦИЯ
 # ============================================================
 
 def is_duplicate(
@@ -989,53 +1136,72 @@ def is_duplicate(
     memory
 ):
 
-    topic = topic.lower().strip()
+    topic_normalized = (
+        topic.lower()
+        .strip()
+    )
 
-    post = post.lower().strip()
+    post_words = set(
+        re.findall(
+            r"\w+",
+            post.lower()
+        )
+    )
 
     for old in memory:
 
-        old_topic = old.get(
-            "topic",
-            ""
-        ).lower().strip()
+        old_topic = (
+            old.get(
+                "topic",
+                ""
+            )
+            .lower()
+            .strip()
+        )
 
         old_post = old.get(
             "post",
             ""
-        ).lower().strip()
+        ).lower()
 
-        # Точная тема
+        # Одинаковая тема
         if (
             old_topic
-            and old_topic == topic
+            and old_topic == topic_normalized
         ):
 
             return True
 
-        # Сравнение текста
+        # Очень похожий пост
+        old_words = set(
+            re.findall(
+                r"\w+",
+                old_post
+            )
+        )
+
         if (
-            old_post
-            and len(post) > 40
+            len(post_words) >= 12
+            and len(old_words) >= 12
         ):
 
-            old_words = set(
-                old_post.split()
+            intersection = (
+                post_words
+                & old_words
             )
 
-            new_words = set(
-                post.split()
+            similarity = (
+                len(intersection)
+                /
+                max(
+                    len(post_words),
+                    len(old_words)
+                )
             )
 
-            if new_words:
+            if similarity >= 0.75:
 
-                similarity = len(
-                    old_words & new_words
-                ) / len(new_words)
-
-                if similarity > 0.88:
-
-                    return True
+                return True
 
     return False
 
@@ -1065,7 +1231,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 1. Получаем RSS
+    # RSS
     # --------------------------------------------------------
 
     news = get_news()
@@ -1083,7 +1249,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # 2. Приоритет
+    # PRIORITY
     # --------------------------------------------------------
 
     news = select_best_news(
@@ -1091,7 +1257,8 @@ def main():
     )
 
     print(
-        f"Selected {len(news)} high-priority items"
+        f"Selected {len(news)} "
+        f"high-priority items"
     )
 
     print(
@@ -1114,7 +1281,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 3. Читаем статьи
+    # READ
     # --------------------------------------------------------
 
     news = enrich_news(
@@ -1122,20 +1289,20 @@ def main():
     )
 
     print(
-        f"Successfully read "
-        f"{len(news)} articles"
+        f"Prepared {len(news)} "
+        f"articles for Gemini"
     )
 
     if not news:
 
         print(
-            "Could not read any articles."
+            "No readable news."
         )
 
         return
 
     # --------------------------------------------------------
-    # 4. Gemini
+    # GEMINI
     # --------------------------------------------------------
 
     result = analyze_news(
@@ -1158,7 +1325,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # 5. Ничего нового
+    # NO NEWS
     # --------------------------------------------------------
 
     if result.strip() == "NO_NEWS":
@@ -1170,7 +1337,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # 6. Получаем пост
+    # POST
     # --------------------------------------------------------
 
     post, topic = extract_topic(
@@ -1188,13 +1355,13 @@ def main():
     if not topic:
 
         print(
-            "No topic returned."
+            "Gemini did not return TOPIC."
         )
 
         return
 
     # --------------------------------------------------------
-    # 7. Проверяем дубль
+    # DUPLICATE
     # --------------------------------------------------------
 
     if is_duplicate(
@@ -1211,7 +1378,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # 8. Отправляем Telegram
+    # TELEGRAM
     # --------------------------------------------------------
 
     send_telegram(
@@ -1219,7 +1386,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # 9. Сохраняем память
+    # MEMORY
     # --------------------------------------------------------
 
     memory.append({
