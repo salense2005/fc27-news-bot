@@ -67,7 +67,7 @@ MEMORY_FILE = "published_news.json"
 
 # Как часто проверять новости.
 # 10 минут = 600 секунд.
-CHECK_INTERVAL = 10 * 60
+CHECK_INTERVAL = 5 * 60
 
 # Сколько элементов брать из каждого Google News RSS.
 MAX_RSS_ITEMS_PER_QUERY = 10
