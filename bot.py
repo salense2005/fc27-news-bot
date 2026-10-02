@@ -189,7 +189,16 @@ def get_news():
 
     for query in SEARCH_QUERIES:
         try:
-            feed = feedparser.parse(make_rss_url(query))
+            # IMPORTANT: never use feedparser.parse(URL) directly here.
+            # It can block for minutes when Google News/RSS is slow.
+            rss_url = make_rss_url(query)
+            response = requests.get(
+                rss_url,
+                headers=HEADERS,
+                timeout=8,
+            )
+            response.raise_for_status()
+            feed = feedparser.parse(response.content)
 
             for entry in feed.entries[:MAX_RSS_ITEMS_PER_QUERY]:
                 title = clean_text(entry.get("title", ""))
@@ -681,7 +690,7 @@ def is_duplicate(topic, post, memory):
 def run_cycle(memory):
     print("\n================================")
     print("Starting news check")
-    print("================================")
+    print("================================", flush=True)
 
     news = get_news()
     print(f"Found {len(news)} raw news items")
@@ -762,7 +771,7 @@ def run_cycle(memory):
 
     save_memory(memory)
 
-    print("================================")
+    print("================================", flush=True)
     print(f"Published: {topic}")
     print("================================")
 
@@ -775,12 +784,12 @@ def run_cycle(memory):
 
 def main():
     print("================================")
-    print("LilsNews started")
+    print("LilsNews started", flush=True)
     print("================================")
-    print(f"Check interval: {CHECK_INTERVAL // 60} minutes")
+    print(f"Check interval: {CHECK_INTERVAL // 60} minutes", flush=True)
 
     memory = load_memory()
-    print(f"Memory: {len(memory)} events")
+    print(f"Memory: {len(memory)} events", flush=True)
 
     if not test_telegram():
         print("Telegram connection failed. STOP.")
