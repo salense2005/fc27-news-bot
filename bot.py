@@ -8,9 +8,14 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
+# Источники поиска новостей
 RSS_FEEDS = [
-    "https://news.google.com/rss/search?q=EA%20FC%2027&hl=en-US&gl=US&ceid=US:en",
-    "https://news.google.com/rss/search?q=EA%20SPORTS%20FC%2027&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027%20meta&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027%20Ultimate%20Team&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027%20SBC&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027%20players%20tactics&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027%20gameplay&hl=en-US&gl=US&ceid=US:en",
+    "https://news.google.com/rss/search?q=EA%20FC%2027%20patch&hl=en-US&gl=US&ceid=US:en",
 ]
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -19,78 +24,220 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    requests.post(
+    response = requests.post(
         url,
         json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
-            "disable_web_page_preview": False,
+            "disable_web_page_preview": True,
         },
         timeout=30,
     )
 
+    response.raise_for_status()
+
 
 def get_news():
     news = []
-    seen = set()
+    seen_links = set()
 
-    for url in RSS_FEEDS:
-        feed = feedparser.parse(url)
+    for feed_url in RSS_FEEDS:
+        try:
+            feed = feedparser.parse(feed_url)
 
-        for entry in feed.entries[:10]:
-            title = entry.get("title", "").strip()
-            link = entry.get("link", "").strip()
+            for entry in feed.entries[:10]:
+                title = entry.get("title", "").strip()
+                link = entry.get("link", "").strip()
 
-            if title and link and link not in seen:
-                seen.add(link)
+                if not title or not link:
+                    continue
+
+                if link in seen_links:
+                    continue
+
+                seen_links.add(link)
+
                 news.append({
                     "title": title,
                     "link": link
                 })
 
-    return news[:10]
+        except Exception as error:
+            print(f"RSS error: {error}")
+
+    return news[:40]
 
 
 def generate_post(news):
-    news_text = "\n\n".join(
-        f"ЗАГОЛОВОК: {item['title']}\nССЫЛКА: {item['link']}"
-        for item in news
-    )
+    news_text = ""
+
+    for index, item in enumerate(news, start=1):
+        news_text += (
+            f"{index}. {item['title']}\n"
+            f"LINK: {item['link']}\n\n"
+        )
 
     prompt = f"""
-Ты редактор Telegram-канала LilsNews про EA SPORTS FC 27.
+Ты — главный редактор Telegram-канала LilsNews про EA SPORTS FC 27.
 
-Вот свежие новости:
+Твоя задача — НЕ пересказывать все новости подряд.
+
+Тебе нужно выбрать только такие новости, которые реально заинтересуют игрока FC 27
+и заставят его открыть пост.
+
+Вот найденные материалы:
 
 {news_text}
 
-Выбери самые важные новости для игроков FC 27.
+========================
+ПРИОРИТЕТ НОВОСТЕЙ
+========================
 
-Напиши короткий пост на русском языке.
+1. META 🔥
+- новые мета-игроки;
+- сильные карты;
+- игроки, которых начали массово использовать;
+- новые сильные связки;
+- изменения меты;
+- сильные PlayStyles;
+- сильные позиции;
+- находки игроков.
 
-Правила:
-- не выдумывай факты;
-- слухи обязательно обозначай как слухи;
-- не пиши незначительные новости;
-- используй несколько эмодзи;
-- текст должен быть коротким;
-- в конце дай ссылку на источник.
+2. ULTIMATE TEAM 💰
+- новые SBC;
+- новые промокарты;
+- Objectives;
+- Evolutions;
+- новые награды;
+- сильные и выгодные карты;
+- важные изменения Ultimate Team.
 
-Формат:
+3. GAMEPLAY 🎮
+- изменения геймплея;
+- новые механики;
+- сильные удары;
+- эффективные пасы;
+- забегания;
+- финты;
+- изменения после патчей;
+- вещи, которые реально влияют на игру.
 
-🔥 ЗАГОЛОВОК
+4. ТАКТИКИ ⚡
+- новые мета-тактики;
+- формации;
+- инструкции;
+- тактики, которые используют сильные игроки;
+- интересные тактические находки.
 
-Краткое описание новости.
+5. MARKET 📈
+- важные изменения рынка;
+- резкое падение/рост цен;
+- карты, которые стали выгодными;
+- важные события для рынка.
+
+6. ОСТАЛЬНОЕ
+Публиковать только если новость действительно очень важная
+для обычного игрока FC 27.
+
+========================
+ЧТО ЗАПРЕЩЕНО
+========================
+
+НЕ публикуй:
+
+- обычные мелкие патчноуты;
+- незначительные исправления багов;
+- рекламные статьи;
+- длинные интервью;
+- новости, которые интересны только разработчикам;
+- очевидные вещи;
+- повторяющиеся новости;
+- длинные списки изменений;
+- новости без пользы для игрока;
+- обычные статьи ради количества постов.
+
+Очень важно:
+
+ЛУЧШЕ НЕ ОПУБЛИКОВАТЬ НОВОСТЬ,
+ЧЕМ ОПУБЛИКОВАТЬ НЕИНТЕРЕСНУЮ НОВОСТЬ.
+
+========================
+СТИЛЬ
+========================
+
+Пост должен читаться за 5–10 секунд.
+
+Максимум: 50–70 слов.
+
+Заголовок — короткий и цепляющий.
+
+Основной текст — максимум 2–4 коротких предложения.
+
+Не используй длинные объяснения.
+
+Не пересказывай всю статью.
+
+Не добавляй ссылки.
+
+НЕ указывай источник.
+
+НЕ пиши:
+
+"Источник:"
+"Подробнее:"
+"Читать далее:"
+
+Не используй Markdown-ссылки.
+
+Не добавляй огромные списки.
+
+Используй 1–3 подходящих эмодзи.
+
+========================
+СЛУХИ
+========================
+
+Если новость является слухом или неподтвержденной информацией,
+в начале поста обязательно поставь:
+
+⚠️ СЛУХ
+
+Не выдавай слух за подтвержденную информацию.
+
+========================
+ФОРМАТ
+========================
+
+🔥 Короткий цепляющий заголовок
+
+2–4 коротких предложения с самой важной информацией.
+
+Если действительно необходимо:
 
 📌 Главное:
-• пункт
-• пункт
+• один важный пункт
+• второй важный пункт
 
-🔗 Источник: ссылка
+Но используй список только если без него информация будет менее понятной.
 
-Если ничего важного нет, напиши:
+========================
+ВАЖНО
+========================
+
+Если среди найденных материалов НЕТ новости,
+которая соответствует этим требованиям,
+ответь строго:
+
 NO_NEWS
+
+Если есть несколько материалов об одном событии,
+не создавай несколько постов.
+
+Выбери только САМУЮ интересную и важную новость.
+
+Не придумывай факты.
 """
+
 
     models = [
         "gemini-3.5-flash-lite",
@@ -100,7 +247,7 @@ NO_NEWS
     for model in models:
         for attempt in range(3):
             try:
-                print(f"Trying {model}, attempt {attempt + 1}")
+                print(f"Trying model: {model}, attempt: {attempt + 1}")
 
                 response = client.models.generate_content(
                     model=model,
@@ -111,7 +258,7 @@ NO_NEWS
                     return response.text.strip()
 
             except Exception as error:
-                print(f"{model} error: {error}")
+                print(f"Gemini error: {error}")
 
                 if attempt < 2:
                     time.sleep(10)
@@ -120,12 +267,16 @@ NO_NEWS
 
 
 def main():
+    print("LilsNews started")
+
     news = get_news()
+
+    print(f"Found {len(news)} news items")
 
     if not news:
         send_telegram(
             "🤖 LilsNews\n\n"
-            "Новости FC 27 не найдены."
+            "Свежих новостей FC 27 пока не найдено."
         )
         return
 
@@ -134,20 +285,20 @@ def main():
     if post is None:
         send_telegram(
             "⚠️ LilsNews\n\n"
-            "Новости найдены, но Gemini сейчас недоступен."
+            "Новости найдены, но Gemini временно недоступен."
         )
         return
 
     if post == "NO_NEWS":
-        send_telegram(
-            "🤖 LilsNews\n\n"
-            "Новых важных новостей FC 27 пока нет."
-        )
+        print("No important news found.")
         return
 
     send_telegram(
-        "📰 LILSNEWS\n\n" + post
+        "📰 LILSNEWS\n\n"
+        + post
     )
+
+    print("Post sent to Telegram")
 
 
 if __name__ == "__main__":
