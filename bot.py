@@ -3,13 +3,12 @@ import json
 import time
 import re
 import html
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from google import genai
-from googlenewsdecoder import gnewsdecoder
 
 
 # ============================================================
@@ -30,16 +29,12 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/140.0.0.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-    ),
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 
 # ============================================================
-# SEARCH QUERIES
+# SEARCH
 # ============================================================
 
 SEARCH_QUERIES = [
@@ -58,17 +53,11 @@ SEARCH_QUERIES = [
 ]
 
 
-# ============================================================
-# GOOGLE NEWS RSS
-# ============================================================
-
 def make_rss_url(query):
-
-    encoded = quote_plus(query)
-
     return (
         "https://news.google.com/rss/search?"
-        f"q={encoded}&hl=en-US&gl=US&ceid=US:en"
+        f"q={quote_plus(query)}"
+        "&hl=en-US&gl=US&ceid=US:en"
     )
 
 
@@ -93,7 +82,18 @@ def send_telegram(message):
         timeout=30,
     )
 
+    print(
+        f"Telegram HTTP status: {response.status_code}"
+    )
+
+    if response.status_code != 200:
+        print(
+            f"Telegram response: {response.text}"
+        )
+
     response.raise_for_status()
+
+    print("Telegram message sent successfully.")
 
 
 # ============================================================
@@ -106,21 +106,19 @@ def load_memory():
         return []
 
     try:
-
         with open(
             MEMORY_FILE,
             "r",
             encoding="utf-8"
-        ) as file:
+        ) as f:
 
-            data = json.load(file)
+            data = json.load(f)
 
             if isinstance(data, list):
                 return data
 
-    except Exception as error:
-
-        print(f"Memory error: {error}")
+    except Exception as e:
+        print(f"Memory error: {e}")
 
     return []
 
@@ -133,18 +131,18 @@ def save_memory(memory):
         MEMORY_FILE,
         "w",
         encoding="utf-8"
-    ) as file:
+    ) as f:
 
         json.dump(
             memory,
-            file,
+            f,
             ensure_ascii=False,
             indent=2
         )
 
 
 # ============================================================
-# CLEAN TEXT
+# TEXT
 # ============================================================
 
 def clean_text(text):
@@ -164,23 +162,102 @@ def clean_text(text):
 
 
 # ============================================================
-# EXTRACT ARTICLE TEXT
+# GOOGLE NEWS REDIRECT
+# ============================================================
+
+def decode_google_news_url(url):
+
+    if "news.google.com/rss/articles/" not in url:
+        return url
+
+    try:
+
+        print(
+            f"Google News URL: {url}"
+        )
+
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=20,
+            allow_redirects=True
+        )
+
+        final_url = response.url
+
+        # Иногда Google оставляет redirect page.
+        # Ищем реальные ссылки на странице.
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser"
+        )
+
+        candidates = []
+
+        for a in soup.find_all("a", href=True):
+
+            href = a.get("href")
+
+            if not href:
+                continue
+
+            if href.startswith("http"):
+
+                if (
+                    "news.google.com" not in href
+                    and "google.com" not in href
+                ):
+                    candidates.append(href)
+
+        # Выбираем наиболее похожую на статью ссылку.
+        if candidates:
+
+            for candidate in candidates:
+
+                host = urlparse(
+                    candidate
+                ).netloc.lower()
+
+                if host and "google" not in host:
+
+                    print(
+                        f"REAL ARTICLE URL: "
+                        f"{candidate}"
+                    )
+
+                    return candidate
+
+        print(
+            f"Final URL: {final_url}"
+        )
+
+        return final_url
+
+    except Exception as e:
+
+        print(
+            f"Google URL decode error: {e}"
+        )
+
+        return url
+
+
+# ============================================================
+# ARTICLE EXTRACTION
 # ============================================================
 
 def extract_article_text(soup):
 
     # --------------------------------------------------------
-    # JSON-LD articleBody
+    # JSON-LD
     # --------------------------------------------------------
-
-    scripts = soup.find_all(
-        "script",
-        type="application/ld+json"
-    )
 
     json_bodies = []
 
-    for script in scripts:
+    for script in soup.find_all(
+        "script",
+        type="application/ld+json"
+    ):
 
         raw = script.string or script.get_text()
 
@@ -190,6 +267,8 @@ def extract_article_text(soup):
         try:
 
             data = json.loads(raw)
+
+            objects = []
 
             if isinstance(data, list):
                 objects = data
@@ -201,21 +280,20 @@ def extract_article_text(soup):
                 else:
                     objects = [data]
 
-            else:
-                objects = []
-
             for obj in objects:
 
                 if not isinstance(obj, dict):
                     continue
 
-                body = obj.get("articleBody")
+                body = obj.get(
+                    "articleBody"
+                )
 
                 if body:
 
                     body = clean_text(body)
 
-                    if len(body) >= 500:
+                    if len(body) > 500:
                         json_bodies.append(body)
 
         except Exception:
@@ -266,9 +344,10 @@ def extract_article_text(soup):
             for bad in element.select(
                 "script,style,noscript,"
                 "nav,footer,header,"
-                "iframe,svg,"
+                "svg,iframe,"
                 ".advertisement,.ads,"
-                ".social,.comments,.comment"
+                ".social,.comments,"
+                ".comment"
             ):
                 bad.decompose()
 
@@ -291,7 +370,7 @@ def extract_article_text(soup):
 
 
     # --------------------------------------------------------
-    # PARAGRAPH FALLBACK
+    # PARAGRAPHS
     # --------------------------------------------------------
 
     paragraphs = []
@@ -310,105 +389,29 @@ def extract_article_text(soup):
 
     if paragraphs:
 
-        text = "\n".join(paragraphs)
+        result = "\n".join(
+            paragraphs
+        )
 
-        if len(text) >= 500:
-            return text
+        if len(result) >= 500:
+            return result
 
     return ""
 
 
 # ============================================================
-# GOOGLE NEWS DECODER
-# ============================================================
-
-def decode_google_news_url(url):
-
-    if "news.google.com" not in url:
-        return url
-
-    print("Decoding Google News URL...")
-
-    try:
-
-        result = gnewsdecoder(
-            url,
-            interval=1,
-            timeout=20
-        )
-
-        if not result.get("success"):
-
-            print(
-                "Google News decoder failed:"
-            )
-
-            print(
-                result.get(
-                    "message",
-                    "Unknown error"
-                )
-            )
-
-            return None
-
-        decoded_url = result.get(
-            "decoded_url"
-        )
-
-        if not decoded_url:
-
-            print(
-                "Decoder returned empty URL."
-            )
-
-            return None
-
-        print(
-            f"REAL ARTICLE URL: {decoded_url}"
-        )
-
-        return decoded_url
-
-    except Exception as error:
-
-        print(
-            f"Google News decoder error: "
-            f"{error}"
-        )
-
-        return None
-
-
-# ============================================================
-# FETCH REAL ARTICLE
+# FETCH ARTICLE
 # ============================================================
 
 def fetch_article(url):
 
     try:
 
-        print(
-            f"Google News URL: {url}"
-        )
-
-        # ----------------------------------------------------
-        # GOOGLE NEWS -> REAL WEBSITE
-        # ----------------------------------------------------
-
         real_url = decode_google_news_url(url)
 
-        if not real_url:
-
-            print(
-                "Could not decode Google News URL."
-            )
-
-            return None
-
-        # ----------------------------------------------------
-        # FETCH REAL WEBSITE
-        # ----------------------------------------------------
+        print(
+            f"Fetching real article: {real_url}"
+        )
 
         response = requests.get(
             real_url,
@@ -417,15 +420,8 @@ def fetch_article(url):
             allow_redirects=True
         )
 
-        final_url = response.url
-
         print(
-            f"Final URL: {final_url}"
-        )
-
-        print(
-            f"HTTP status: "
-            f"{response.status_code}"
+            f"HTTP status: {response.status_code}"
         )
 
         if response.status_code != 200:
@@ -436,30 +432,10 @@ def fetch_article(url):
 
             return None
 
-        content_type = response.headers.get(
-            "content-type",
-            ""
-        ).lower()
-
-        if (
-            "text/html" not in content_type
-            and "application/xhtml" not in content_type
-        ):
-
-            print(
-                f"Not HTML: {content_type}"
-            )
-
-            return None
-
         soup = BeautifulSoup(
             response.text,
             "html.parser"
         )
-
-        # ----------------------------------------------------
-        # TITLE
-        # ----------------------------------------------------
 
         title = ""
 
@@ -469,76 +445,52 @@ def fetch_article(url):
                 soup.title.get_text()
             )
 
-        # ----------------------------------------------------
-        # REMOVE JUNK
-        # ----------------------------------------------------
-
+        # Удаляем мусор только после
+        # получения title.
         for tag in soup.select(
             "script,style,noscript,"
-            "svg,iframe,nav,footer,header,form"
+            "svg,iframe,nav,footer"
         ):
-
             tag.decompose()
-
-        # ----------------------------------------------------
-        # EXTRACT ARTICLE
-        # ----------------------------------------------------
 
         text = extract_article_text(
             soup
         )
-
-        if not text:
-
-            print(
-                "No article text found."
-            )
-
-            return None
 
         print(
             f"Extracted REAL article text: "
             f"{len(text)} characters"
         )
 
-        # ----------------------------------------------------
-        # HARD CHECK
-        # ----------------------------------------------------
-
-        if len(text) < 700:
+        if len(text) < 500:
 
             print(
-                "Real article content too short. "
-                "Skipping."
+                "Article content too short."
             )
 
             return None
 
-        # ----------------------------------------------------
-        # LIMIT SIZE
-        # ----------------------------------------------------
-
-        if len(text) > 20000:
-
-            text = text[:20000]
+        # Не перегружаем Gemini.
+        if len(text) > 18000:
+            text = text[:18000]
 
         return {
             "title": title,
-            "url": final_url,
+            "url": response.url,
             "text": text,
         }
 
-    except Exception as error:
+    except Exception as e:
 
         print(
-            f"Article fetch error: {error}"
+            f"Article fetch error: {e}"
         )
 
         return None
 
 
 # ============================================================
-# GET NEWS
+# NEWS
 # ============================================================
 
 def get_news():
@@ -548,12 +500,10 @@ def get_news():
 
     for query in SEARCH_QUERIES:
 
-        rss_url = make_rss_url(query)
-
         try:
 
             feed = feedparser.parse(
-                rss_url
+                make_rss_url(query)
             )
 
             for entry in feed.entries[:10]:
@@ -576,39 +526,28 @@ def get_news():
                 if not title or not link:
                     continue
 
-                title_lower = title.lower()
+                low = title.lower()
 
-                # ------------------------------------------------
-                # ONLY FC27
-                # ------------------------------------------------
-
+                # Только FC27.
                 if (
-                    "fc 27" not in title_lower
-                    and "fc27" not in title_lower
+                    "fc 27" not in low
+                    and "fc27" not in low
                 ):
                     continue
 
-                # ------------------------------------------------
-                # REMOVE OLD GAMES
-                # ------------------------------------------------
-
+                # Не брать FC25/FC26.
                 if (
-                    "fc 26" in title_lower
-                    or "fc26" in title_lower
-                    or "fc 25" in title_lower
-                    or "fc25" in title_lower
+                    "fc 26" in low
+                    or "fc26" in low
+                    or "fc 25" in low
+                    or "fc25" in low
                 ):
                     continue
 
-                # ------------------------------------------------
-                # DUPLICATE TITLES
-                # ------------------------------------------------
-
-                normalized = (
-                    title_lower
-                    .replace(" ", "")
-                    .replace("-", "")
-                    .replace(":", "")
+                normalized = re.sub(
+                    r"[^a-z0-9]+",
+                    "",
+                    low
                 )
 
                 if normalized in seen:
@@ -624,10 +563,10 @@ def get_news():
                     ),
                 })
 
-        except Exception as error:
+        except Exception as e:
 
             print(
-                f"RSS error: {error}"
+                f"RSS error: {e}"
             )
 
     return news
@@ -639,13 +578,13 @@ def get_news():
 
 def calculate_priority(title):
 
-    title = title.lower()
+    t = title.lower()
 
     score = 0
 
     keywords = {
         "sbc": 150,
-        "new sbc": 50,
+        "new sbc": 200,
         "card": 100,
         "cards": 100,
         "player": 80,
@@ -664,16 +603,16 @@ def calculate_priority(title):
         "team 1": 70,
         "leak": 60,
         "leaked": 60,
-        "patch": 90,
+        "patch": 100,
         "update": 50,
         "objective": 80,
         "evolution": 80,
         "upgrade": 60,
     }
 
-    for keyword, points in keywords.items():
+    for word, points in keywords.items():
 
-        if keyword in title:
+        if word in t:
             score += points
 
     return score
@@ -705,7 +644,7 @@ def prepare_articles(news):
 
     for i, item in enumerate(
         news,
-        start=1
+        1
     ):
 
         print(
@@ -757,10 +696,7 @@ def prepare_articles(news):
 # GEMINI
 # ============================================================
 
-def analyze_news(
-    articles,
-    memory
-):
+def analyze_news(articles, memory):
 
     if not articles:
         return None
@@ -769,24 +705,21 @@ def analyze_news(
 
     for i, article in enumerate(
         articles,
-        start=1
+        1
     ):
 
         articles_text += f"""
-==================================================
-МАТЕРИАЛ {i}
-==================================================
 
-ЗАГОЛОВОК:
+================ ARTICLE {i} ================
+
+TITLE:
 {article["title"]}
 
-URL:
-{article["url"]}
-
-ПОЛНЫЙ ТЕКСТ:
+FULL ARTICLE TEXT:
 {article["text"]}
 
-==================================================
+ARTICLE END
+==============================================
 """
 
 
@@ -795,253 +728,188 @@ URL:
     for item in memory[-50:]:
 
         memory_text += f"""
-TOPIC:
+OLD TOPIC:
 {item.get("topic", "")}
 
-POST:
+OLD POST:
 {item.get("post", "")}
-
-==================================================
 """
 
 
     prompt = f"""
-Ты главный редактор Telegram-канала LilsNews
-по EA SPORTS FC 27.
+You are the editor of LilsNews, a Telegram channel
+about EA SPORTS FC 27 Ultimate Team.
 
-Твоя задача — делать короткие, КОНКРЕТНЫЕ
-новостные посты для игроков EA FC 27 Ultimate Team.
+Your job is to select ONE genuinely useful NEW piece
+of information from the FULL ARTICLE TEXT provided below.
 
-Ниже тебе переданы реальные тексты статей.
+IMPORTANT:
+Do NOT write a post based only on a headline.
+
+You have the actual article text.
+Use concrete information from it.
 
 ==================================================
-КРИТИЧЕСКОЕ ПРАВИЛО
+WHAT COUNTS AS GOOD NEWS
 ==================================================
 
-НИКОГДА НЕ ПИШИ ПОСТ ТОЛЬКО ПО ЗАГОЛОВКУ.
+SBC:
+- player
+- rating
+- position
+- requirements
+- price
+- rewards
+- expiry
 
-Используй ТОЛЬКО информацию,
-которая реально присутствует
-в ПОЛНОМ ТЕКСТЕ статьи.
+CARDS:
+- player names
+- ratings
+- positions
+- card type
+- important stats
 
-Если статья говорит:
+META / TACTICS:
+- formation
+- player roles
+- instructions
+- width
+- depth
+- build-up
+- defensive approach
+- specific settings
+- specific pro-player setup
 
-"утекли карты Team 2"
+GAMEPLAY:
+- specific changes to passing
+- shooting
+- dribbling
+- defending
+- runs
+- goalkeepers
+- playstyles
+- mechanics
 
-но текст не содержит игроков,
-рейтингов или другой конкретики,
+PATCH:
+- exact gameplay changes
+- exact Ultimate Team changes
+- exact fixes
 
-НЕ ПЫТАЙСЯ ДОГАДЫВАТЬСЯ.
+LEAK:
+- actual leaked player names
+- ratings
+- positions
+- SBC/objective details
+- upgrade path
+- release dates
 
-Ответ:
+==================================================
+ABSOLUTE RULE
+==================================================
+
+NEVER invent information.
+
+If the article only says:
+
+"Team 2 has leaked"
+
+but does not provide actual useful details,
+DO NOT publish it.
+
+Return:
 
 NO_NEWS
 
-==================================================
-META / ТАКТИКИ
-==================================================
+The same applies to tactics.
 
-Если статья посвящена META,
-формации или тактикам,
-обязательно ищи конкретные значения:
+If an article says:
+"4-4-2 is meta"
 
-• формация
-• роли
-• инструкции
-• ширина
-• глубина
-• build-up
-• defensive approach
-• player roles
-• конкретный pro player
-• конкретные настройки
-
-Если статья содержит:
-
-4-4-2
-Width 45
-Depth 65
-ST Get In Behind
-
-можно написать эти данные.
-
-Если статья содержит только:
-
-"4-4-2 is one of the best formations"
-
-это НЕ достаточно.
-
-В таком случае:
-
-NO_NEWS
-
-НИКОГДА НЕ ПРИДУМЫВАЙ
-настройки самостоятельно.
-
-==================================================
-SBC
-==================================================
-
-Если статья о SBC,
-показывай конкретику:
-
-• имя игрока
-• OVR
-• позиция
-• цена
-• требования
-• награды
-• срок
-
-Только если информация есть.
-
-==================================================
-КАРТЫ
-==================================================
-
-Показывай:
-
-• игрок
-• OVR
-• позиция
-• тип карты
-• характеристики
-
-Только если есть в тексте.
-
-==================================================
-GAMEPLAY
-==================================================
-
-Ищи конкретные изменения:
-
-• shots
-• passing
-• dribbling
-• defending
-• goalkeeper
-• runs
-• playstyles
-• mechanics
-
-==================================================
-PATCH
-==================================================
-
-Не пиши:
-
-"EA выпустила патч."
-
-Показывай конкретные изменения:
-
-• что исправили
-• что изменили
-• что усилили
-• что ослабили
-
-==================================================
-LEAK
-==================================================
-
-Если это leak,
-показывай конкретные данные:
-
-Игрок — OVR
-Игрок — OVR
-Игрок — OVR
-
-или конкретные SBC,
-Objectives,
-Upgrade Path и т.д.
+but does not provide actual useful tactical
+details, do not invent player instructions,
+width, depth, etc.
 
 ==================================================
 DUPLICATES
 ==================================================
 
-Уже опубликованные новости:
+Previously published:
 
 {memory_text}
 
-Не публикуй ту же информацию повторно.
+Do not repeat the exact same information.
 
-Но если старая тема получила новые конкретные данные,
-её можно публиковать снова.
-
-==================================================
-ПРИОРИТЕТ
-==================================================
-
-1. Новый SBC
-2. Новые конкретные карты
-3. META / тактика с конкретными настройками
-4. Информация от pro player
-5. Gameplay
-6. Patch
-7. Promo
-8. Leak с конкретными данными
-9. Objectives
-10. Evolutions
+If an old topic appears again but the new article
+contains genuinely NEW concrete information,
+it can be published.
 
 ==================================================
-ЗАПРЕЩЕНО
+STYLE
 ==================================================
 
-❌ "инсайдеры сообщили"
-❌ "в сети появилась информация"
-❌ "ожидается релиз"
-❌ "стало известно"
-❌ вода
-❌ пересказ заголовка
-❌ придумывание игроков
-❌ придумывание рейтингов
-❌ придумывание цен
-❌ придумывание тактик
-❌ придумывание META
-❌ выдавать старую информацию за новую
+Write in Russian.
 
-==================================================
-ДЛИНА
-==================================================
+Short Telegram-style post.
 
-30–100 слов.
+Approximately 40-100 words.
 
-Лучше коротко и конкретно.
+No source link.
 
-==================================================
-ИСТОЧНИК
-==================================================
+No "инсайдеры сообщили" filler.
 
-Источник НЕ показывай.
+No "в сети появилась информация" filler.
 
-Ссылку НЕ добавляй.
+No generic introduction.
 
-==================================================
-ФОРМАТ
-==================================================
+Start with:
 
 📰 LILSNEWS
 
-[КАТЕГОРИЯ]
+Then category:
 
-[КОРОТКИЙ ЗАГОЛОВОК]
+🔥 META
+🃏 SBC
+⚠️ СЛУХ
+🎮 GAMEPLAY
+🛠 ПАТЧ
+🟣 PROMO
+⭐ CARDS
 
-[КОНКРЕТНАЯ ИНФОРМАЦИЯ]
+Then a short headline.
 
-В конце:
-
-TOPIC: уникальная тема новости
+Then concrete information.
 
 ==================================================
-ЕСЛИ НЕТ КОНКРЕТНОЙ НОВОЙ ИНФОРМАЦИИ
+OUTPUT
 ==================================================
 
-Ответь строго:
+Return ONLY the Telegram post.
+
+At the VERY END add:
+
+TOPIC: short unique topic
+
+Example:
+
+📰 LILSNEWS
+
+🔥 META
+
+4-4-2 от Anders Vejrgang
+
+В материале указано, что Vejrgang использует 4-4-2
+с конкретными настройками...
+
+TOPIC: Vejrgang 4-4-2 tactics
+
+If there is no genuinely useful new information,
+return ONLY:
 
 NO_NEWS
 
 ==================================================
 
-МАТЕРИАЛЫ:
+ARTICLES:
 
 {articles_text}
 """
@@ -1070,12 +938,27 @@ NO_NEWS
 
                 if response and response.text:
 
-                    return response.text.strip()
+                    result = response.text.strip()
 
-            except Exception as error:
+                    print(
+                        "Gemini returned "
+                        f"{len(result)} characters."
+                    )
+
+                    print(
+                        "Gemini raw result:"
+                    )
+
+                    print(
+                        result[:3000]
+                    )
+
+                    return result
+
+            except Exception as e:
 
                 print(
-                    f"Gemini error: {error}"
+                    f"Gemini error: {e}"
                 )
 
                 if attempt < 2:
@@ -1085,55 +968,206 @@ NO_NEWS
 
 
 # ============================================================
-# EXTRACT TOPIC
+# EXTRACT GEMINI RESULT
 # ============================================================
 
-def extract_topic(result):
+def extract_post_and_topic(result):
 
-    lines = result.splitlines()
+    if not result:
+        return None, None
 
-    post_lines = []
-    topic = ""
+    result = result.strip()
+
+    # --------------------------------------------------------
+    # NO NEWS
+    # --------------------------------------------------------
+
+    if result.upper() == "NO_NEWS":
+        return None, None
+
+    # Убираем markdown code fences,
+    # если Gemini зачем-то их добавил.
+    result = re.sub(
+        r"^```(?:text|markdown)?",
+        "",
+        result,
+        flags=re.IGNORECASE
+    )
+
+    result = re.sub(
+        r"```$",
+        "",
+        result
+    ).strip()
+
+    # --------------------------------------------------------
+    # ИЩЕМ TOPIC
+    # --------------------------------------------------------
+
+    topic_match = re.search(
+        r"(?im)^\s*TOPIC\s*:\s*(.+?)\s*$",
+        result
+    )
+
+    if topic_match:
+
+        topic = topic_match.group(1).strip()
+
+        post = (
+            result[:topic_match.start()]
+            .strip()
+        )
+
+    else:
+
+        # ====================================================
+        # ВАЖНЫЙ FIX
+        # Gemini иногда НЕ возвращает TOPIC.
+        # В таком случае не блокируем публикацию.
+        # ====================================================
+
+        print(
+            "WARNING: Gemini did not return TOPIC."
+        )
+
+        topic = generate_fallback_topic(
+            result
+        )
+
+        post = result.strip()
+
+    # --------------------------------------------------------
+    # CLEAN
+    # --------------------------------------------------------
+
+    post = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        post
+    ).strip()
+
+    topic = re.sub(
+        r"\s+",
+        " ",
+        topic
+    ).strip()
+
+    # --------------------------------------------------------
+    # НЕ ПУБЛИКУЕМ МУСОР
+    # --------------------------------------------------------
+
+    if len(post) < 30:
+
+        print(
+            "Post is too short."
+        )
+
+        return None, None
+
+    if len(topic) < 5:
+
+        print(
+            "Topic is too short."
+        )
+
+        return None, None
+
+    return post, topic
+
+
+# ============================================================
+# FALLBACK TOPIC
+# ============================================================
+
+def generate_fallback_topic(post):
+
+    """
+    Gemini иногда забывает TOPIC.
+    Не делаем второй API-запрос.
+    Создаём техническую тему из текста поста.
+    """
+
+    text = post
+
+    # Убираем служебные заголовки.
+    text = re.sub(
+        r"(?i)📰\s*LILSNEWS",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"(?i)🔥\s*META|🃏\s*SBC|⚠️\s*СЛУХ|"
+        r"🎮\s*GAMEPLAY|🛠\s*ПАТЧ|🟣\s*PROMO|"
+        r"⭐\s*CARDS",
+        "",
+        text
+    )
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+    # Берём наиболее содержательные первые строки.
+    useful = []
 
     for line in lines:
 
-        if line.strip().upper().startswith(
-            "TOPIC:"
-        ):
+        if len(line) < 8:
+            continue
 
-            topic = line.split(
-                ":",
-                1
-            )[1].strip()
+        if line.startswith("TOPIC:"):
+            continue
 
-        else:
+        useful.append(line)
 
-            post_lines.append(line)
+        if len(useful) >= 2:
+            break
 
-    post = "\n".join(
-        post_lines
+    if useful:
+
+        topic = " ".join(useful)
+
+    else:
+
+        topic = text[:100]
+
+    # Нормализуем.
+    topic = re.sub(
+        r"[^\w\sА-Яа-яЁё0-9\-]",
+        " ",
+        topic
+    )
+
+    topic = re.sub(
+        r"\s+",
+        " ",
+        topic
     ).strip()
 
-    return post, topic
+    return topic[:160]
 
 
 # ============================================================
 # DUPLICATE CHECK
 # ============================================================
 
-def is_duplicate(
-    topic,
-    post,
-    memory
-):
+def normalize_words(text):
 
-    topic_normalized = (
-        topic.lower().strip()
+    return set(
+        re.findall(
+            r"[a-zA-Zа-яА-ЯёЁ0-9]+",
+            text.lower()
+        )
     )
 
-    post_normalized = (
-        post.lower().strip()
-    )
+
+def is_duplicate(topic, post, memory):
+
+    new_topic = topic.lower().strip()
+    new_words = normalize_words(post)
 
     for old in memory:
 
@@ -1146,51 +1180,51 @@ def is_duplicate(
             .strip()
         )
 
-        old_post = (
-            old.get(
-                "post",
-                ""
-            )
-            .lower()
-            .strip()
+        old_post = old.get(
+            "post",
+            ""
         )
 
+        # Точное совпадение topic.
         if (
             old_topic
-            and old_topic == topic_normalized
+            and old_topic == new_topic
         ):
+
+            print(
+                f"Duplicate topic: {topic}"
+            )
+
             return True
 
-        if (
+        # Проверка похожести текста.
+        if len(new_words) < 10:
+            continue
+
+        old_words = normalize_words(
             old_post
-            and len(post_normalized) > 50
-        ):
+        )
 
-            old_words = set(
-                re.findall(
-                    r"\b\w+\b",
-                    old_post
-                )
+        if len(old_words) < 10:
+            continue
+
+        intersection = (
+            len(new_words & old_words)
+        )
+
+        similarity = (
+            intersection /
+            max(len(new_words), 1)
+        )
+
+        if similarity >= 0.88:
+
+            print(
+                f"Duplicate post similarity: "
+                f"{similarity:.2f}"
             )
 
-            new_words = set(
-                re.findall(
-                    r"\b\w+\b",
-                    post_normalized
-                )
-            )
-
-            if not new_words:
-                continue
-
-            similarity = (
-                len(old_words & new_words)
-                /
-                len(new_words)
-            )
-
-            if similarity > 0.85:
-                return True
+            return True
 
     return False
 
@@ -1219,8 +1253,9 @@ def main():
         f"Memory: {len(memory)} events"
     )
 
+
     # --------------------------------------------------------
-    # SEARCH
+    # NEWS
     # --------------------------------------------------------
 
     news = get_news()
@@ -1237,11 +1272,14 @@ def main():
 
         return
 
+
     # --------------------------------------------------------
     # PRIORITY
     # --------------------------------------------------------
 
-    news = select_best_news(news)
+    news = select_best_news(
+        news
+    )
 
     print(
         f"Selected {len(news)} "
@@ -1254,7 +1292,7 @@ def main():
 
     for i, item in enumerate(
         news,
-        start=1
+        1
     ):
 
         print(
@@ -1267,11 +1305,14 @@ def main():
         "--------------------------------"
     )
 
+
     # --------------------------------------------------------
-    # REAL ARTICLES
+    # ARTICLES
     # --------------------------------------------------------
 
-    articles = prepare_articles(news)
+    articles = prepare_articles(
+        news
+    )
 
     if not articles:
 
@@ -1286,6 +1327,7 @@ def main():
         f"articles for Gemini"
     )
 
+
     # --------------------------------------------------------
     # GEMINI
     # --------------------------------------------------------
@@ -1295,36 +1337,36 @@ def main():
         memory
     )
 
-    if result is None:
+    if not result:
 
         print(
-            "Gemini unavailable."
+            "Gemini returned nothing."
         )
 
         return
 
-    # --------------------------------------------------------
-    # NO NEWS
-    # --------------------------------------------------------
 
-    if result.strip() == "NO_NEWS":
+    if result.strip().upper() == "NO_NEWS":
 
         print(
-            "No new important news."
+            "No new useful news."
         )
 
         return
 
+
     # --------------------------------------------------------
-    # POST
+    # EXTRACT
     # --------------------------------------------------------
 
-    post, topic = extract_topic(result)
+    post, topic = extract_post_and_topic(
+        result
+    )
 
     if not post:
 
         print(
-            "Empty post."
+            "Could not create post."
         )
 
         return
@@ -1332,10 +1374,32 @@ def main():
     if not topic:
 
         print(
-            "No topic returned."
+            "Could not create topic."
         )
 
         return
+
+
+    print(
+        "--------------------------------"
+    )
+
+    print(
+        "FINAL POST:"
+    )
+
+    print(
+        post
+    )
+
+    print(
+        "--------------------------------"
+    )
+
+    print(
+        f"FINAL TOPIC: {topic}"
+    )
+
 
     # --------------------------------------------------------
     # DUPLICATE
@@ -1348,16 +1412,30 @@ def main():
     ):
 
         print(
-            f"Duplicate blocked: {topic}"
+            "Publication blocked: duplicate."
         )
 
         return
+
 
     # --------------------------------------------------------
     # TELEGRAM
     # --------------------------------------------------------
 
-    send_telegram(post)
+    try:
+
+        send_telegram(
+            post
+        )
+
+    except Exception as e:
+
+        print(
+            f"TELEGRAM SEND FAILED: {e}"
+        )
+
+        return
+
 
     # --------------------------------------------------------
     # MEMORY
@@ -1366,10 +1444,27 @@ def main():
     memory.append({
         "topic": topic,
         "post": post,
-        "timestamp": int(time.time())
+        "timestamp": int(
+            time.time()
+        )
     })
 
-    save_memory(memory)
+    try:
+
+        save_memory(
+            memory
+        )
+
+        print(
+            "Memory saved successfully."
+        )
+
+    except Exception as e:
+
+        print(
+            f"Memory save error: {e}"
+        )
+
 
     print(
         "================================"
@@ -1383,6 +1478,10 @@ def main():
         "================================"
     )
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
