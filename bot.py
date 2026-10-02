@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import feedparser
 from google import genai
@@ -7,7 +8,6 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# Поиск свежих новостей FC 27 через Google News RSS
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=EA%20FC%2027&hl=en-US&gl=US&ceid=US:en",
     "https://news.google.com/rss/search?q=EA%20SPORTS%20FC%2027&hl=en-US&gl=US&ceid=US:en",
@@ -54,27 +54,16 @@ def get_news():
             if hasattr(entry, "source"):
                 source = entry.source.get("title", "")
 
-            news.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "source": source,
-                }
-            )
+            news.append({
+                "title": title,
+                "link": link,
+                "source": source
+            })
 
     return news[:10]
 
 
-def main():
-    news = get_news()
-
-    if not news:
-        send_telegram(
-            "🤖 LilsNews\n\n"
-            "Проверил источники FC 27, но новых материалов не нашёл."
-        )
-        return
-
+def generate_post(news):
     news_text = ""
 
     for item in news:
@@ -85,30 +74,29 @@ def main():
         )
 
     prompt = f"""
-Ты редактор Telegram-канала LilsNews, посвящённого EA SPORTS FC 27.
+Ты редактор Telegram-канала LilsNews про EA SPORTS FC 27.
 
-Ниже находятся свежие материалы, найденные в новостной ленте:
+Вот свежие найденные материалы:
 
 {news_text}
 
-Твоя задача:
+Выбери только действительно важные новости для игроков FC 27.
 
-1. Выбери только действительно важные новости для игроков EA SPORTS FC 27.
-2. Не пиши посты про обычные статьи, рекламу или незначительные материалы.
-3. Не придумывай никаких фактов.
-4. Если информация является слухом или неподтверждённой информацией, обязательно укажи это.
-5. Если есть несколько материалов об одном событии, объедини их в одну новость.
-6. Пиши на русском языке.
-7. Стиль — короткий, современный Telegram-канал про FC 27.
-8. Используй эмодзи, но без перебора.
-9. Заголовок должен сразу объяснять, что произошло.
-10. В конце обязательно дай ссылку на источник.
+Правила:
+- Пиши на русском языке.
+- Не выдумывай факты.
+- Не выдавай слухи за подтвержденную информацию.
+- Если это слух — прямо напиши «слух» или «неподтвержденная информация».
+- Не пиши про обычные незначительные статьи.
+- Если несколько источников сообщают об одном событии — объедини их.
+- Используй умеренное количество эмодзи.
+- Пост должен быть коротким и удобным для Telegram.
 
 Формат:
 
 🔥 ЗАГОЛОВОК
 
-Короткое объяснение новости в 2–5 предложениях.
+Кратко объясни, что произошло.
 
 📌 Главное:
 • пункт
@@ -117,17 +105,48 @@ def main():
 
 🔗 Источник: ссылка
 
-Если среди материалов нет действительно важной новости, напиши строго:
+Если нет действительно важной новости, ответь только:
 
 NO_NEWS
 """
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-    )
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=prompt,
+            )
 
-    post = response.text.strip()
+            return response.text.strip()
+
+        except Exception as error:
+            print(f"Gemini error, attempt {attempt + 1}: {error}")
+
+            if attempt < 2:
+                time.sleep(10)
+            else:
+                return None
+
+
+def main():
+    news = get_news()
+
+    if not news:
+        send_telegram(
+            "🤖 LilsNews\n\n"
+            "Проверил источники FC 27, но новостей пока не нашёл."
+        )
+        return
+
+    post = generate_post(news)
+
+    if post is None:
+        send_telegram(
+            "⚠️ LilsNews\n\n"
+            "Новости найдены, но Gemini временно не смог обработать запрос. "
+            "Попробую снова при следующем запуске."
+        )
+        return
 
     if post == "NO_NEWS":
         send_telegram(
