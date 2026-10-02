@@ -3,12 +3,13 @@ import json
 import time
 import re
 import html
-from urllib.parse import urlparse
+from urllib.parse import quote_plus
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from google import genai
+from googlenewsdecoder import gnewsdecoder
 
 
 # ============================================================
@@ -38,7 +39,7 @@ HEADERS = {
 
 
 # ============================================================
-# GOOGLE NEWS SEARCH
+# SEARCH QUERIES
 # ============================================================
 
 SEARCH_QUERIES = [
@@ -57,13 +58,11 @@ SEARCH_QUERIES = [
 ]
 
 
-def make_rss_url(query):
-    """
-    Правильно создаём Google News RSS URL.
-    Не собираем URL вручную с пробелами.
-    """
+# ============================================================
+# GOOGLE NEWS RSS
+# ============================================================
 
-    from urllib.parse import quote_plus
+def make_rss_url(query):
 
     encoded = quote_plus(query)
 
@@ -165,13 +164,13 @@ def clean_text(text):
 
 
 # ============================================================
-# ARTICLE TEXT EXTRACTION
+# EXTRACT ARTICLE TEXT
 # ============================================================
 
 def extract_article_text(soup):
 
     # --------------------------------------------------------
-    # 1. JSON-LD ArticleBody
+    # JSON-LD articleBody
     # --------------------------------------------------------
 
     scripts = soup.find_all(
@@ -192,8 +191,6 @@ def extract_article_text(soup):
 
             data = json.loads(raw)
 
-            objects = []
-
             if isinstance(data, list):
                 objects = data
 
@@ -201,65 +198,39 @@ def extract_article_text(soup):
 
                 if "@graph" in data:
                     objects = data["@graph"]
-
                 else:
                     objects = [data]
+
+            else:
+                objects = []
 
             for obj in objects:
 
                 if not isinstance(obj, dict):
                     continue
 
-                article_body = obj.get(
-                    "articleBody"
-                )
+                body = obj.get("articleBody")
 
-                if article_body:
+                if body:
 
-                    json_bodies.append(
-                        clean_text(article_body)
-                    )
+                    body = clean_text(body)
+
+                    if len(body) >= 500:
+                        json_bodies.append(body)
 
         except Exception:
             continue
 
     if json_bodies:
 
-        best = max(
+        return max(
             json_bodies,
             key=len
         )
 
-        if len(best) >= 500:
-            return best
-
 
     # --------------------------------------------------------
-    # 2. Meta description
-    # --------------------------------------------------------
-
-    meta_parts = []
-
-    for attr in [
-        {"name": "description"},
-        {"property": "og:description"},
-        {"name": "twitter:description"},
-    ]:
-
-        tag = soup.find(
-            "meta",
-            attrs=attr
-        )
-
-        if tag and tag.get("content"):
-
-            meta_parts.append(
-                clean_text(tag["content"])
-            )
-
-
-    # --------------------------------------------------------
-    # 3. Common article containers
+    # ARTICLE CONTAINERS
     # --------------------------------------------------------
 
     selectors = [
@@ -286,22 +257,18 @@ def extract_article_text(soup):
     for selector in selectors:
 
         try:
-
-            elements = soup.select(
-                selector
-            )
-
+            elements = soup.select(selector)
         except Exception:
             continue
 
         for element in elements:
 
-            # Убираем мусор
             for bad in element.select(
                 "script,style,noscript,"
                 "nav,footer,header,"
-                ".advertisement,.ads,.social,"
-                ".comments,.comment"
+                "iframe,svg,"
+                ".advertisement,.ads,"
+                ".social,.comments,.comment"
             ):
                 bad.decompose()
 
@@ -312,23 +279,19 @@ def extract_article_text(soup):
                 )
             )
 
-            if len(text) >= 300:
-
+            if len(text) >= 500:
                 candidates.append(text)
-
 
     if candidates:
 
-        best = max(
+        return max(
             candidates,
             key=len
         )
 
-        return best
-
 
     # --------------------------------------------------------
-    # 4. Fallback: paragraphs
+    # PARAGRAPH FALLBACK
     # --------------------------------------------------------
 
     paragraphs = []
@@ -347,29 +310,78 @@ def extract_article_text(soup):
 
     if paragraphs:
 
-        text = "\n".join(
-            paragraphs
-        )
+        text = "\n".join(paragraphs)
 
-        if len(text) >= 300:
+        if len(text) >= 500:
             return text
-
-
-    # --------------------------------------------------------
-    # 5. Description only
-    # --------------------------------------------------------
-
-    if meta_parts:
-
-        return " ".join(
-            meta_parts
-        )
 
     return ""
 
 
 # ============================================================
-# FETCH ARTICLE
+# GOOGLE NEWS DECODER
+# ============================================================
+
+def decode_google_news_url(url):
+
+    if "news.google.com" not in url:
+        return url
+
+    print("Decoding Google News URL...")
+
+    try:
+
+        result = gnewsdecoder(
+            url,
+            interval=1,
+            timeout=20
+        )
+
+        if not result.get("success"):
+
+            print(
+                "Google News decoder failed:"
+            )
+
+            print(
+                result.get(
+                    "message",
+                    "Unknown error"
+                )
+            )
+
+            return None
+
+        decoded_url = result.get(
+            "decoded_url"
+        )
+
+        if not decoded_url:
+
+            print(
+                "Decoder returned empty URL."
+            )
+
+            return None
+
+        print(
+            f"REAL ARTICLE URL: {decoded_url}"
+        )
+
+        return decoded_url
+
+    except Exception as error:
+
+        print(
+            f"Google News decoder error: "
+            f"{error}"
+        )
+
+        return None
+
+
+# ============================================================
+# FETCH REAL ARTICLE
 # ============================================================
 
 def fetch_article(url):
@@ -377,13 +389,31 @@ def fetch_article(url):
     try:
 
         print(
-            f"Fetching: {url}"
+            f"Google News URL: {url}"
         )
 
+        # ----------------------------------------------------
+        # GOOGLE NEWS -> REAL WEBSITE
+        # ----------------------------------------------------
+
+        real_url = decode_google_news_url(url)
+
+        if not real_url:
+
+            print(
+                "Could not decode Google News URL."
+            )
+
+            return None
+
+        # ----------------------------------------------------
+        # FETCH REAL WEBSITE
+        # ----------------------------------------------------
+
         response = requests.get(
-            url,
+            real_url,
             headers=HEADERS,
-            timeout=25,
+            timeout=30,
             allow_redirects=True
         )
 
@@ -393,11 +423,15 @@ def fetch_article(url):
             f"Final URL: {final_url}"
         )
 
+        print(
+            f"HTTP status: "
+            f"{response.status_code}"
+        )
+
         if response.status_code != 200:
 
             print(
-                f"HTTP status: "
-                f"{response.status_code}"
+                "Article returned bad HTTP status."
             )
 
             return None
@@ -423,20 +457,32 @@ def fetch_article(url):
             "html.parser"
         )
 
-        # Удаляем очевидный мусор
-        for tag in soup.select(
-            "script,style,noscript,"
-            "svg,iframe,nav,footer"
-        ):
-
-            tag.decompose()
+        # ----------------------------------------------------
+        # TITLE
+        # ----------------------------------------------------
 
         title = ""
 
         if soup.title:
+
             title = clean_text(
                 soup.title.get_text()
             )
+
+        # ----------------------------------------------------
+        # REMOVE JUNK
+        # ----------------------------------------------------
+
+        for tag in soup.select(
+            "script,style,noscript,"
+            "svg,iframe,nav,footer,header,form"
+        ):
+
+            tag.decompose()
+
+        # ----------------------------------------------------
+        # EXTRACT ARTICLE
+        # ----------------------------------------------------
 
         text = extract_article_text(
             soup
@@ -451,28 +497,30 @@ def fetch_article(url):
             return None
 
         print(
-            f"Extracted text: "
+            f"Extracted REAL article text: "
             f"{len(text)} characters"
         )
 
         # ----------------------------------------------------
-        # КРИТИЧЕСКАЯ ПРОВЕРКА
+        # HARD CHECK
         # ----------------------------------------------------
 
-        if len(text) < 500:
+        if len(text) < 700:
 
             print(
-                "Article content too short. "
+                "Real article content too short. "
                 "Skipping."
             )
 
             return None
 
-        # Ограничиваем размер,
-        # чтобы не отправлять Gemini гигантские статьи
-        if len(text) > 18000:
+        # ----------------------------------------------------
+        # LIMIT SIZE
+        # ----------------------------------------------------
 
-            text = text[:18000]
+        if len(text) > 20000:
+
+            text = text[:20000]
 
         return {
             "title": title,
@@ -490,7 +538,7 @@ def fetch_article(url):
 
 
 # ============================================================
-# NEWS SEARCH
+# GET NEWS
 # ============================================================
 
 def get_news():
@@ -500,9 +548,7 @@ def get_news():
 
     for query in SEARCH_QUERIES:
 
-        rss_url = make_rss_url(
-            query
-        )
+        rss_url = make_rss_url(query)
 
         try:
 
@@ -532,7 +578,20 @@ def get_news():
 
                 title_lower = title.lower()
 
-                # Старые игры сразу убираем
+                # ------------------------------------------------
+                # ONLY FC27
+                # ------------------------------------------------
+
+                if (
+                    "fc 27" not in title_lower
+                    and "fc27" not in title_lower
+                ):
+                    continue
+
+                # ------------------------------------------------
+                # REMOVE OLD GAMES
+                # ------------------------------------------------
+
                 if (
                     "fc 26" in title_lower
                     or "fc26" in title_lower
@@ -541,18 +600,15 @@ def get_news():
                 ):
                     continue
 
-                # Только FC27
-                if (
-                    "fc 27" not in title_lower
-                    and "fc27" not in title_lower
-                ):
-                    continue
+                # ------------------------------------------------
+                # DUPLICATE TITLES
+                # ------------------------------------------------
 
-                # Дубликаты
                 normalized = (
                     title_lower
                     .replace(" ", "")
                     .replace("-", "")
+                    .replace(":", "")
                 )
 
                 if normalized in seen:
@@ -587,89 +643,38 @@ def calculate_priority(title):
 
     score = 0
 
-    # SBC
-    if "sbc" in title:
-        score += 150
+    keywords = {
+        "sbc": 150,
+        "new sbc": 50,
+        "card": 100,
+        "cards": 100,
+        "player": 80,
+        "players": 80,
+        "rating": 80,
+        "ratings": 80,
+        "meta": 120,
+        "tactic": 110,
+        "tactics": 110,
+        "formation": 100,
+        "gameplay": 90,
+        "pro player": 100,
+        "vejrgang": 120,
+        "promo": 70,
+        "team 2": 70,
+        "team 1": 70,
+        "leak": 60,
+        "leaked": 60,
+        "patch": 90,
+        "update": 50,
+        "objective": 80,
+        "evolution": 80,
+        "upgrade": 60,
+    }
 
-    if "new sbc" in title:
-        score += 50
+    for keyword, points in keywords.items():
 
-    # Cards
-    if "card" in title:
-        score += 100
-
-    if "cards" in title:
-        score += 100
-
-    # Players
-    if "player" in title:
-        score += 80
-
-    if "players" in title:
-        score += 80
-
-    # Ratings
-    if "rating" in title:
-        score += 80
-
-    if "ratings" in title:
-        score += 80
-
-    # META
-    if "meta" in title:
-        score += 120
-
-    if "tactic" in title:
-        score += 110
-
-    if "tactics" in title:
-        score += 110
-
-    if "formation" in title:
-        score += 100
-
-    if "gameplay" in title:
-        score += 90
-
-    if "pro player" in title:
-        score += 100
-
-    if "vejrgang" in title:
-        score += 120
-
-    # Promo
-    if "promo" in title:
-        score += 70
-
-    if "team 2" in title:
-        score += 70
-
-    if "team 1" in title:
-        score += 70
-
-    # Leak
-    if "leak" in title:
-        score += 60
-
-    if "leaked" in title:
-        score += 60
-
-    # Patch
-    if "patch" in title:
-        score += 90
-
-    if "update" in title:
-        score += 50
-
-    # Objectives
-    if "objective" in title:
-        score += 80
-
-    if "evolution" in title:
-        score += 80
-
-    if "upgrade" in title:
-        score += 60
+        if keyword in title:
+            score += points
 
     return score
 
@@ -678,10 +683,8 @@ def select_best_news(news):
 
     for item in news:
 
-        item["priority"] = (
-            calculate_priority(
-                item["title"]
-            )
+        item["priority"] = calculate_priority(
+            item["title"]
         )
 
     news.sort(
@@ -760,9 +763,7 @@ def analyze_news(
 ):
 
     if not articles:
-
         return None
-
 
     articles_text = ""
 
@@ -779,7 +780,10 @@ def analyze_news(
 ЗАГОЛОВОК:
 {article["title"]}
 
-ТЕКСТ СТАТЬИ:
+URL:
+{article["url"]}
+
+ПОЛНЫЙ ТЕКСТ:
 {article["text"]}
 
 ==================================================
@@ -805,300 +809,225 @@ POST:
 Ты главный редактор Telegram-канала LilsNews
 по EA SPORTS FC 27.
 
-Твоя задача — находить ИМЕННО КОНКРЕТНУЮ
-новую информацию, которая интересна игроку
-EA FC 27 Ultimate Team.
+Твоя задача — делать короткие, КОНКРЕТНЫЕ
+новостные посты для игроков EA FC 27 Ultimate Team.
 
-У тебя есть ПОЛНЫЕ ТЕКСТЫ статей ниже.
+Ниже тебе переданы реальные тексты статей.
 
 ==================================================
-ГЛАВНОЕ ПРАВИЛО
+КРИТИЧЕСКОЕ ПРАВИЛО
 ==================================================
 
 НИКОГДА НЕ ПИШИ ПОСТ ТОЛЬКО ПО ЗАГОЛОВКУ.
 
-Используй только факты, которые реально есть
-в ТЕКСТЕ СТАТЬИ.
+Используй ТОЛЬКО информацию,
+которая реально присутствует
+в ПОЛНОМ ТЕКСТЕ статьи.
 
-Если в статье написано:
+Если статья говорит:
 
 "утекли карты Team 2"
 
-но дальше нет названий игроков,
-рейтингов или других конкретных данных —
+но текст не содержит игроков,
+рейтингов или другой конкретики,
 
-НЕ ПИШИ:
+НЕ ПЫТАЙСЯ ДОГАДЫВАТЬСЯ.
 
-"утекли карты Team 2".
-
-Это бесполезно.
-
-В таком случае ответь:
+Ответ:
 
 NO_NEWS
 
 ==================================================
-ЧТО МНЕ НУЖНО
+META / ТАКТИКИ
 ==================================================
 
-🔥 SBC
+Если статья посвящена META,
+формации или тактикам,
+обязательно ищи конкретные значения:
 
-Если статья сообщает о новом SBC,
-покажи конкретно:
+• формация
+• роли
+• инструкции
+• ширина
+• глубина
+• build-up
+• defensive approach
+• player roles
+• конкретный pro player
+• конкретные настройки
+
+Если статья содержит:
+
+4-4-2
+Width 45
+Depth 65
+ST Get In Behind
+
+можно написать эти данные.
+
+Если статья содержит только:
+
+"4-4-2 is one of the best formations"
+
+это НЕ достаточно.
+
+В таком случае:
+
+NO_NEWS
+
+НИКОГДА НЕ ПРИДУМЫВАЙ
+настройки самостоятельно.
+
+==================================================
+SBC
+==================================================
+
+Если статья о SBC,
+показывай конкретику:
+
+• имя игрока
+• OVR
+• позиция
+• цена
+• требования
+• награды
+• срок
+
+Только если информация есть.
+
+==================================================
+КАРТЫ
+==================================================
+
+Показывай:
 
 • игрок
 • OVR
 • позиция
-• требования
-• цена
-• награды
-• срок
-
-Но только то, что реально есть в тексте.
-
----
-
-🃏 НОВЫЕ КАРТЫ
-
-Покажи:
-
-• имя игрока
-• OVR
-• позицию
 • тип карты
-• важные характеристики
+• характеристики
 
-Если информация есть.
+Только если есть в тексте.
 
----
+==================================================
+GAMEPLAY
+==================================================
 
-🔥 META / ТАКТИКИ
+Ищи конкретные изменения:
 
-Это ОЧЕНЬ ВАЖНО.
-
-Если статья про новую META,
-найди конкретные данные:
-
-• формация
-• роли игроков
-• инструкции
-• ширина
-• глубина
-• стиль игры
-• конкретные приёмы
-• конкретные настройки
-• какой pro использует тактику
-
-Например:
-
-🔥 META 4-4-2
-
-• ST — Get In Behind
-• CM — Stay Back
-• Width — 45
-• Depth — 65
-
-Только если эти значения действительно
-присутствуют в статье.
-
-НЕ ПРИДУМЫВАЙ настройки.
-
----
-
-🎮 GAMEPLAY
-
-Покажи конкретные изменения:
-
-• удары
-• пасы
-• дриблинг
-• защита
-• забегания
+• shots
+• passing
+• dribbling
+• defending
 • goalkeeper
+• runs
 • playstyles
-• механики
+• mechanics
 
----
+==================================================
+PATCH
+==================================================
 
-🛠 ПАТЧ
+Не пиши:
 
-Покажи именно изменения патча.
+"EA выпустила патч."
 
-Не:
+Показывай конкретные изменения:
 
-"EA выпустила новый патч."
+• что исправили
+• что изменили
+• что усилили
+• что ослабили
 
-А:
+==================================================
+LEAK
+==================================================
 
-"EA изменила X,
-исправила Y,
-усилила Z."
-
-Только конкретные изменения из текста.
-
----
-
-⚠️ LEAK
-
-Если это утечка,
-покажи конкретику:
+Если это leak,
+показывай конкретные данные:
 
 Игрок — OVR
 Игрок — OVR
 Игрок — OVR
 
-или:
-
-SBC
-Objective
-Upgrade path
-
-если это действительно указано.
+или конкретные SBC,
+Objectives,
+Upgrade Path и т.д.
 
 ==================================================
 DUPLICATES
 ==================================================
 
-Ниже находится память уже опубликованных постов.
+Уже опубликованные новости:
 
 {memory_text}
 
-Не публикуй одну и ту же информацию повторно.
+Не публикуй ту же информацию повторно.
 
-ВАЖНО:
-
-Одна тема может появиться снова,
-если появились НОВЫЕ КОНКРЕТНЫЕ ДАННЫЕ.
-
-Например:
-
-Первый пост:
-"Утек Team 2."
-
-Второй материал:
-"Haaland 91 OVR,
-Diani 88 OVR,
-Upamecano 88 OVR."
-
-Второй материал МОЖНО публиковать,
-потому что появилась новая информация.
-
-Но если второй материал снова говорит:
-"Team 2 leaked"
-
-без новых данных —
-
-NO_NEWS.
+Но если старая тема получила новые конкретные данные,
+её можно публиковать снова.
 
 ==================================================
-ВЫБОР
+ПРИОРИТЕТ
 ==================================================
-
-Выбери максимум ОДНУ новость.
-
-Выбирай ту, которая принесёт игроку
-реальную пользу прямо сейчас.
-
-Приоритет:
 
 1. Новый SBC
 2. Новые конкретные карты
-3. Новая META / тактика
-4. Конкретные данные от pro player
+3. META / тактика с конкретными настройками
+4. Информация от pro player
 5. Gameplay
-6. Патч
-7. Новая промо
-8. Leak с конкретными игроками
+6. Patch
+7. Promo
+8. Leak с конкретными данными
 9. Objectives
 10. Evolutions
-
-НЕ выбирай статью только потому,
-что у неё громкий заголовок.
 
 ==================================================
 ЗАПРЕЩЕНО
 ==================================================
 
-❌ "инсайдеры сообщили" без конкретики
-
+❌ "инсайдеры сообщили"
 ❌ "в сети появилась информация"
-
 ❌ "ожидается релиз"
-
-❌ длинные вступления
-
+❌ "стало известно"
 ❌ вода
-
-❌ пересказ всей статьи
-
-❌ придумывать игроков
-
-❌ придумывать рейтинги
-
-❌ придумывать цены
-
-❌ придумывать SBC
-
-❌ придумывать тактики
-
-❌ придумывать meta
-
+❌ пересказ заголовка
+❌ придумывание игроков
+❌ придумывание рейтингов
+❌ придумывание цен
+❌ придумывание тактик
+❌ придумывание META
 ❌ выдавать старую информацию за новую
 
 ==================================================
 ДЛИНА
 ==================================================
 
-Обычно 30–90 слов.
+30–100 слов.
 
-Лучше 50 слов с конкретными данными,
-чем 120 слов воды.
+Лучше коротко и конкретно.
 
 ==================================================
 ИСТОЧНИК
 ==================================================
 
-НЕ показывай источник.
+Источник НЕ показывай.
 
-НЕ добавляй ссылку.
+Ссылку НЕ добавляй.
 
 ==================================================
 ФОРМАТ
 ==================================================
 
-Начало:
-
 📰 LILSNEWS
 
-Затем категория:
+[КАТЕГОРИЯ]
 
-🔥 META
+[КОРОТКИЙ ЗАГОЛОВОК]
 
-или
+[КОНКРЕТНАЯ ИНФОРМАЦИЯ]
 
-🃏 SBC
-
-или
-
-⚠️ СЛУХ
-
-или
-
-🎮 GAMEPLAY
-
-или
-
-🛠 ПАТЧ
-
-или
-
-🟣 PROMO
-
-Затем короткий заголовок.
-
-Затем конкретные данные.
-
-В самом конце ОБЯЗАТЕЛЬНО:
+В конце:
 
 TOPIC: уникальная тема новости
 
@@ -1109,6 +1038,12 @@ TOPIC: уникальная тема новости
 Ответь строго:
 
 NO_NEWS
+
+==================================================
+
+МАТЕРИАЛЫ:
+
+{articles_text}
 """
 
 
@@ -1116,7 +1051,6 @@ NO_NEWS
         "gemini-3.5-flash-lite",
         "gemini-3.8-flash",
     ]
-
 
     for model in models:
 
@@ -1129,21 +1063,14 @@ NO_NEWS
                     f"attempt: {attempt + 1}"
                 )
 
-                response = (
-                    client.models.generate_content(
-                        model=model,
-                        contents=prompt
-                    )
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt
                 )
 
                 if response and response.text:
 
-                    result = (
-                        response.text
-                        .strip()
-                    )
-
-                    return result
+                    return response.text.strip()
 
             except Exception as error:
 
@@ -1158,7 +1085,7 @@ NO_NEWS
 
 
 # ============================================================
-# TOPIC
+# EXTRACT TOPIC
 # ============================================================
 
 def extract_topic(result):
@@ -1183,7 +1110,6 @@ def extract_topic(result):
 
             post_lines.append(line)
 
-
     post = "\n".join(
         post_lines
     ).strip()
@@ -1202,17 +1128,12 @@ def is_duplicate(
 ):
 
     topic_normalized = (
-        topic
-        .lower()
-        .strip()
+        topic.lower().strip()
     )
 
     post_normalized = (
-        post
-        .lower()
-        .strip()
+        post.lower().strip()
     )
-
 
     for old in memory:
 
@@ -1234,17 +1155,12 @@ def is_duplicate(
             .strip()
         )
 
-
-        # Одинаковая тема
         if (
             old_topic
             and old_topic == topic_normalized
         ):
-
             return True
 
-
-        # Проверка похожести постов
         if (
             old_post
             and len(post_normalized) > 50
@@ -1268,15 +1184,12 @@ def is_duplicate(
                 continue
 
             similarity = (
-                len(
-                    old_words & new_words
-                )
+                len(old_words & new_words)
                 /
                 len(new_words)
             )
 
             if similarity > 0.85:
-
                 return True
 
     return False
@@ -1300,16 +1213,14 @@ def main():
         "================================"
     )
 
-
     memory = load_memory()
 
     print(
         f"Memory: {len(memory)} events"
     )
 
-
     # --------------------------------------------------------
-    # GET NEWS
+    # SEARCH
     # --------------------------------------------------------
 
     news = get_news()
@@ -1317,7 +1228,6 @@ def main():
     print(
         f"Found {len(news)} raw news items"
     )
-
 
     if not news:
 
@@ -1327,14 +1237,11 @@ def main():
 
         return
 
-
     # --------------------------------------------------------
     # PRIORITY
     # --------------------------------------------------------
 
-    news = select_best_news(
-        news
-    )
+    news = select_best_news(news)
 
     print(
         f"Selected {len(news)} "
@@ -1344,7 +1251,6 @@ def main():
     print(
         "--------------------------------"
     )
-
 
     for i, item in enumerate(
         news,
@@ -1357,20 +1263,15 @@ def main():
             f"{item['title']}"
         )
 
-
     print(
         "--------------------------------"
     )
 
-
     # --------------------------------------------------------
-    # READ REAL ARTICLES
+    # REAL ARTICLES
     # --------------------------------------------------------
 
-    articles = prepare_articles(
-        news
-    )
-
+    articles = prepare_articles(news)
 
     if not articles:
 
@@ -1378,17 +1279,12 @@ def main():
             "Could not read any articles."
         )
 
-        # НИЧЕГО НЕ ОТПРАВЛЯЕМ В TELEGRAM.
-        # Лучше пропустить цикл, чем отправить воду.
-
         return
-
 
     print(
         f"Prepared {len(articles)} "
         f"articles for Gemini"
     )
-
 
     # --------------------------------------------------------
     # GEMINI
@@ -1399,7 +1295,6 @@ def main():
         memory
     )
 
-
     if result is None:
 
         print(
@@ -1407,7 +1302,6 @@ def main():
         )
 
         return
-
 
     # --------------------------------------------------------
     # NO NEWS
@@ -1421,15 +1315,11 @@ def main():
 
         return
 
-
     # --------------------------------------------------------
-    # EXTRACT POST
+    # POST
     # --------------------------------------------------------
 
-    post, topic = extract_topic(
-        result
-    )
-
+    post, topic = extract_topic(result)
 
     if not post:
 
@@ -1439,7 +1329,6 @@ def main():
 
         return
 
-
     if not topic:
 
         print(
@@ -1447,7 +1336,6 @@ def main():
         )
 
         return
-
 
     # --------------------------------------------------------
     # DUPLICATE
@@ -1460,39 +1348,28 @@ def main():
     ):
 
         print(
-            f"Duplicate blocked: "
-            f"{topic}"
+            f"Duplicate blocked: {topic}"
         )
 
         return
 
+    # --------------------------------------------------------
+    # TELEGRAM
+    # --------------------------------------------------------
+
+    send_telegram(post)
 
     # --------------------------------------------------------
-    # PUBLISH
-    # --------------------------------------------------------
-
-    send_telegram(
-        post
-    )
-
-
-    # --------------------------------------------------------
-    # SAVE MEMORY
+    # MEMORY
     # --------------------------------------------------------
 
     memory.append({
         "topic": topic,
         "post": post,
-        "timestamp": int(
-            time.time()
-        )
+        "timestamp": int(time.time())
     })
 
-
-    save_memory(
-        memory
-    )
-
+    save_memory(memory)
 
     print(
         "================================"
