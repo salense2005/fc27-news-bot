@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: fc27-news-bot
+  cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -16,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,6 +43,15 @@ jobs:
         run: |
           git config --global user.name "LilsNews Bot"
           git config --global user.email "lilsnews-bot@users.noreply.github.com"
+
           git add published_news.json
-          git diff --cached --quiet || git commit -m "Update news memory"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "No memory changes to save."
+            exit 0
+          fi
+
+          git commit -m "Update news memory"
+
+          git pull --rebase origin main
+          git push origin main
