@@ -24,6 +24,7 @@ def send_telegram(message):
         json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
+            "disable_web_page_preview": False,
         },
         timeout=30,
     )
@@ -42,62 +43,64 @@ def get_news():
 
             if title and link and link not in seen:
                 seen.add(link)
-                news.append(f"{title}\n{link}")
+                news.append({
+                    "title": title,
+                    "link": link
+                })
 
     return news[:10]
 
 
-def main():
-    news = get_news()
-
-    if not news:
-        send_telegram("🤖 LilsNews\n\nНовости FC 27 не найдены.")
-        return
-
-    news_text = "\n\n".join(news)
+def generate_post(news):
+    news_text = "\n\n".join(
+        f"ЗАГОЛОВОК: {item['title']}\nССЫЛКА: {item['link']}"
+        for item in news
+    )
 
     prompt = f"""
 Ты редактор Telegram-канала LilsNews про EA SPORTS FC 27.
 
-Свежие новости:
+Вот свежие новости:
 
 {news_text}
 
-Выбери самую важную новость.
+Выбери самые важные новости для игроков FC 27.
 
 Напиши короткий пост на русском языке.
 
+Правила:
+- не выдумывай факты;
+- слухи обязательно обозначай как слухи;
+- не пиши незначительные новости;
+- используй несколько эмодзи;
+- текст должен быть коротким;
+- в конце дай ссылку на источник.
+
 Формат:
 
-🔥 Заголовок
+🔥 ЗАГОЛОВОК
 
-2-4 предложения с сутью новости.
+Краткое описание новости.
 
 📌 Главное:
-• важный пункт
-• важный пункт
+• пункт
+• пункт
 
 🔗 Источник: ссылка
 
-Не выдумывай информацию.
-Если это слух — напиши, что это слух.
-
-Если ничего важного нет, напиши NO_NEWS.
+Если ничего важного нет, напиши:
+NO_NEWS
 """
 
-    # Пробуем несколько моделей по очереди.
     models = [
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
     ]
 
-    response = None
-
     for model in models:
-        for attempt in range(2):
+        for attempt in range(3):
             try:
-                print(f"Trying model: {model}")
+                print(f"Trying {model}, attempt {attempt + 1}")
 
                 response = client.models.generate_content(
                     model=model,
@@ -105,26 +108,35 @@ def main():
                 )
 
                 if response and response.text:
-                    break
+                    return response.text.strip()
 
             except Exception as error:
-                print(f"Error with {model}: {error}")
+                print(f"{model} error: {error}")
 
-                if attempt == 0:
-                    time.sleep(5)
+                if attempt < 2:
+                    time.sleep(10)
 
-        if response and response.text:
-            break
+    return None
 
-    if not response or not response.text:
+
+def main():
+    news = get_news()
+
+    if not news:
         send_telegram(
-            "⚠️ LilsNews\n\n"
-            "Новости найдены, но ни одна доступная Gemini-модель "
-            "не смогла обработать запрос."
+            "🤖 LilsNews\n\n"
+            "Новости FC 27 не найдены."
         )
         return
 
-    post = response.text.strip()
+    post = generate_post(news)
+
+    if post is None:
+        send_telegram(
+            "⚠️ LilsNews\n\n"
+            "Новости найдены, но Gemini сейчас недоступен."
+        )
+        return
 
     if post == "NO_NEWS":
         send_telegram(
