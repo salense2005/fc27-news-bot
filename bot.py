@@ -3,8 +3,8 @@ import json
 import time
 import re
 import html
-import threading
-from urllib.parse import quote_plus, urlparse
+import threading 
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import feedparser
