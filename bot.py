@@ -57,29 +57,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 MEMORY_FILE = "published_news.json"
 MAX_MEMORY_ITEMS = 500
 
-# ---------------- EDITORIAL MODE (queue -> scoring -> publication windows) ----------------
-EDITORIAL_MODE = True                   # False = OLD behaviour: publish every good news item immediately
-
-SEARCH_INTERVAL = 5 * 60                # how often the bot searches RSS and fills the queue (seconds)
-CHECK_INTERVAL = SEARCH_INTERVAL        # old name, kept for compatibility
-EDITORIAL_INTERVAL = 2 * 60 * 60        # how often Gemini reviews the queue and picks the best news (seconds)
-MAX_DAILY_POSTS = 4                     # HARD limit of regular news posts per rolling 24 hours
-BREAKING_SCORE = 95                     # importance score (0-100) from which a news item may skip the window
-MIN_PUBLICATION_SCORE = 80              # minimum score for a regular post (65-79 = medium, stays in queue)
-MAX_PENDING_NEWS = 200                  # maximum number of waiting candidates in pending_news.json
-
-QUEUE_FILE = "pending_news.json"        # persistent queue of candidates (survives restarts)
-MEDIUM_SCORE = 65                       # below this = LOW: rejected and never published
-EDITORIAL_MAX_POSTS = 3                 # maximum posts per ONE editorial window (TOP 1..3)
-MAX_BREAKING_PER_DAY = 2                # breaking posts allowed per rolling 24 hours (exempt from MAX_DAILY_POSTS)
-BREAKING_CHECK_INTERVAL = 20 * 60       # at most one breaking review per this many seconds
-RUMOR_MIN_SCORE = 90                    # unconfirmed news / rumors need at least this score
-EDITORIAL_MAX_CANDIDATES = 40           # candidates sent to Gemini in one review
-TRIAGE_CHARS = 700                      # article characters shown to Gemini during the review
-QUEUE_TEXT_CHARS = 5000                 # article characters stored in the queue per candidate
-PENDING_TTL = 24 * 3600                 # waiting candidates older than this are dropped
-REJECTED_KEEP = 72 * 3600               # rejected candidates are remembered this long (anti-repeat)
-MAX_REVIEW_ATTEMPTS = 2                 # failed write/publish attempts before a selected event is dropped
+CHECK_INTERVAL = 5 * 60                 # pause between cycles
 CYCLE_WATCHDOG_SECONDS = 20 * 60        # dump stack traces into the log if a cycle hangs
 
 # --- RSS ---
@@ -569,8 +547,6 @@ def remember_publication(memory, post):
         "post_title": post["title"],
         "category": post["category"],
         "post": post["text"],
-        "kind": post.get("kind", "regular"),
-        "score": post.get("score"),
         "timestamp": now_ts(),
     })
     return memory
@@ -760,14 +736,9 @@ def cluster_news(items):
     return clusters
 
 
-def select_fresh_news(news, memory, queue_items=None):
+def select_fresh_news(news, memory):
     mem_urls = memory_url_set(memory)
     mem_titles = memory_title_list(memory)
-    q_urls, q_titles = set(), []
-    for it in queue_items or []:
-        q_urls |= _entry_urls(it)
-        q_titles.append(it.get("title", ""))
-        q_titles.extend(it.get("alt_titles") or [])
     fresh = []
     skipped = in_memory = 0
 
@@ -775,13 +746,10 @@ def select_fresh_news(news, memory, queue_items=None):
         if is_skipped(item):
             skipped += 1
             continue
-        if canonical_url(item["link"]) in mem_urls or canonical_url(item["link"]) in q_urls:
+        if canonical_url(item["link"]) in mem_urls:
             in_memory += 1
             continue
         if any(similar_titles(item["title"], t, 0.85) for t in mem_titles):
-            in_memory += 1
-            continue
-        if q_titles and any(similar_titles(item["title"], t, 0.85) for t in q_titles if t):
             in_memory += 1
             continue
         item["priority"] = calculate_priority(item["title"])
@@ -1039,7 +1007,6 @@ def fetch_article(item):
         "alt_links": item.get("alt_links", []),
         "alt_titles": item.get("alt_titles", []),
         "summary": summary,
-        "source_name": item.get("source_name", ""),
         "image_candidates": [],
         "image_url": "",
     }
@@ -1685,7 +1652,7 @@ def gemini_generate(prompt, schema, purpose):
     return None
 
 
-def build_prompt(materials, memory, editor_events=None):
+def build_prompt(materials, memory):
     published = []
     for e in memory[-60:]:
         label = e.get("post_title") or e.get("topic") or e.get("title")
@@ -1766,19 +1733,6 @@ def build_prompt(materials, memory, editor_events=None):
         "",
         "Ещё раз: пост ТОЛЬКО на русском, ТОЛЬКО факты из материалов, без повторов.",
     ]
-    if editor_events:
-        task = [
-            "ЗАДАНИЕ РЕДАКЦИИ (главное): события уже отобраны. Напиши ровно по одному посту на каждое "
-            "событие из списка, объединяя указанные ARTICLE_ID. Не добавляй другие события. "
-            "Расположи посты по важности (самое важное первым). Если фактов для полноценного поста "
-            "действительно не хватает - пропусти событие, но ничего не выдумывай:",
-        ]
-        for n, ev in enumerate(editor_events, 1):
-            ids = ", ".join(str(i) for i in ev["ids"])
-            task.append(f"{n}) ARTICLE_ID {ids}: {ev['topic']} (категория: {ev['category']})")
-        task.append("")
-        idx = rules.index("УЖЕ ОПУБЛИКОВАНО:")
-        rules[idx:idx] = task
     return "\n".join(rules)
 
 
@@ -2195,17 +2149,16 @@ def publish_post(post, memory, current_posts):
     return True
 
 
-def process_gemini_items(items, materials, memory, max_posts=None, annotate=None, out_posts=None):
+def process_gemini_items(items, materials, memory):
     materials_by_id = {m["id"]: m for m in materials}
     current_posts, repairs_left = [], REPAIR_LIMIT_PER_CYCLE
     published = 0
     used_ids = set()
-    limit = MAX_POSTS_PER_CYCLE if max_posts is None else max_posts
 
     log("PARSE", f"{len(items)} post(s) generated")
     for index, item in enumerate(items, 1):
-        if published >= limit:
-            log("PUBLISH", f"Post limit reached ({limit})")
+        if published >= MAX_POSTS_PER_CYCLE:
+            log("PUBLISH", f"Cycle limit reached ({MAX_POSTS_PER_CYCLE})")
             break
         used_ids.update(item.get("source_ids", []))
 
@@ -2232,8 +2185,6 @@ def process_gemini_items(items, materials, memory, max_posts=None, annotate=None
                     skip_item(materials_by_id[sid], SKIP_TTL_REVIEWED)
             continue
         log("VALIDATE", f"Post {index} OK ({post['category']})")
-        if annotate:
-            annotate(post)
 
         why = duplicate_reason(post, memory, current_posts)
         if why:
@@ -2244,8 +2195,6 @@ def process_gemini_items(items, materials, memory, max_posts=None, annotate=None
 
         if publish_post(post, memory, current_posts):
             published += 1
-            if out_posts is not None:
-                out_posts.append(post)
         # on Telegram failure: nothing is remembered and nothing is skipped -> retried next cycle
 
     for m in materials:
@@ -2430,609 +2379,6 @@ def run_cycle(memory):
 
 
 # ============================================================
-# EDITORIAL SYSTEM
-# SEARCH every SEARCH_INTERVAL -> persistent queue (pending_news.json)
-# -> Gemini reviews the whole queue every EDITORIAL_INTERVAL and scores EVENTS by importance
-# -> best events (max MAX_DAILY_POSTS per 24h) are written by the normal post pipeline
-# -> BREAKING (score >= BREAKING_SCORE) may skip the window
-# The post text, photo and Telegram code are NOT touched: they are the same functions as before.
-# ============================================================
-
-TRUSTED_DOMAINS = (
-    "easports.com", "ea.com", "futbin.com", "fut.gg", "futwiz.com", "eurogamer.net", "ign.com",
-    "gamesradar.com", "videogameschronicle.com", "dexerto.com", "charlieintel.com", "dotesports.com",
-    "gamespot.com", "pcgamer.com", "gameinformer.com", "bbc.com", "bbc.co.uk", "reuters.com",
-    "theguardian.com", "gamesindustry.biz",
-)
-
-BREAKING_HINT_RE = re.compile(
-    r"(patch notes|title update|hotfix|\bofficial(?:ly)?\b|\bea (?:sports )?(?:confirms?|announces?|reveals?)|"
-    r"\bconfirmed\b|\bannounced\b|release date|\bdelayed\b|outage|servers? down|\bbans?\b|banned|"
-    r"game[- ]?breaking|major (?:change|update|patch)|overhaul|\bnerf|\bbuff\b)", re.I)
-
-TRIAGE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "events": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "source_ids": {"type": "array", "items": {"type": "integer"}},
-                    "score": {"type": "integer"},
-                    "category": {"type": "string", "enum": CATEGORY_KEYS},
-                    "topic": {"type": "string"},
-                    "confirmed": {"type": "boolean"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["source_ids", "score", "category", "topic", "confirmed", "reason"],
-            },
-        }
-    },
-    "required": ["events"],
-}
-
-
-def _minutes(seconds):
-    seconds = max(0, int(seconds))
-    h, m = divmod(seconds // 60, 60)
-    return f"{h}h {m:02d}m" if h else f"{m} min"
-
-
-# ---------------- queue storage ----------------
-
-def new_queue():
-    return {"version": 1, "last_editorial_ts": 0, "last_breaking_check_ts": 0, "items": []}
-
-
-def _entry_urls(it):
-    urls = {canonical_url(u) for u in [it.get("rss_url", ""), it.get("url", ""), it.get("link", "")] if u}
-    urls |= {canonical_url(u) for u in (it.get("alt_links") or []) if u}
-    return urls
-
-
-def load_queue():
-    if not os.path.exists(QUEUE_FILE):
-        log("QUEUE", "File does not exist, starting with an empty queue")
-        return new_queue()
-    try:
-        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        queue = new_queue()
-        if isinstance(data, list):
-            raw_items = data
-        elif isinstance(data, dict):
-            queue["last_editorial_ts"] = int(data.get("last_editorial_ts") or 0)
-            queue["last_breaking_check_ts"] = int(data.get("last_breaking_check_ts") or 0)
-            raw_items = data.get("items") or []
-        else:
-            raw_items = []
-        for it in raw_items:
-            if not isinstance(it, dict) or not it.get("title"):
-                continue
-            it.setdefault("status", "pending")
-            if it["status"] == "selected":          # crashed in the middle of a window -> try again
-                it["status"] = "pending"
-            queue["items"].append(it)
-        log("QUEUE", f"Loaded: {len(queue['items'])} items, pending: {len(queue_pending(queue))}")
-        return queue
-    except Exception as exc:
-        error("QUEUE", f"Read error: {err_text(exc)}")
-        try:
-            os.replace(QUEUE_FILE, QUEUE_FILE + ".broken")
-            warn("QUEUE", f"Broken file moved to {QUEUE_FILE}.broken")
-        except Exception:
-            pass
-        return new_queue()
-
-
-def save_queue(queue):
-    try:
-        tmp = QUEUE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(queue, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, QUEUE_FILE)
-    except Exception as exc:
-        error("QUEUE", f"Save error: {err_text(exc)}")
-
-
-def queue_pending(queue):
-    return [it for it in queue["items"] if it.get("status", "pending") == "pending"]
-
-
-def queue_add(queue, articles):
-    """Put freshly fetched articles into the queue. Returns (added, merged)."""
-    now = now_ts()
-    added = merged = 0
-    pending = queue_pending(queue)
-    known = set()
-    for it in queue["items"]:
-        known |= _entry_urls(it)
-
-    for a in articles:
-        if a.get("source_type") == "no_content" or len(a.get("text", "")) < 40:
-            skip_item(a, SKIP_TTL_NO_CONTENT)
-            continue
-        urls = _entry_urls(a)
-        if urls & known:
-            continue
-        target = next((p for p in pending if similar_titles(a["title"], p.get("title", ""), 0.6)), None)
-        if target is not None:                                  # same event from another site
-            extra = [a.get("rss_url", ""), a.get("url", "")] + list(a.get("alt_links") or [])
-            target["alt_links"] = list(dict.fromkeys(list(target.get("alt_links") or []) + [u for u in extra if u]))
-            target["alt_titles"] = list(dict.fromkeys(list(target.get("alt_titles") or []) + [a["title"]]
-                                                      + list(a.get("alt_titles") or [])))
-            if len(a.get("text", "")) > len(target.get("text", "")):
-                target["text"] = a["text"][:QUEUE_TEXT_CHARS]
-                target["source_type"] = a.get("source_type", target.get("source_type"))
-            imgs = list(target.get("image_candidates") or [])
-            for u in a.get("image_candidates") or []:
-                if u not in imgs:
-                    imgs.append(u)
-            target["image_candidates"] = imgs[:MAX_IMAGE_CANDIDATES]
-            known |= urls
-            merged += 1
-            continue
-        entry = dict(a)
-        entry["text"] = a.get("text", "")[:QUEUE_TEXT_CHARS]
-        entry.update({"status": "pending", "discovered_ts": now, "score": None,
-                      "attempts": 0, "breaking_checked": False})
-        queue["items"].append(entry)
-        pending.append(entry)
-        known |= urls
-        added += 1
-    return added, merged
-
-
-def reject_item(it):
-    it["status"] = "rejected"
-    it["decided_ts"] = now_ts()
-    it["text"] = ""                      # keep only title/urls for anti-repeat checks
-
-
-def queue_prune(queue):
-    now = now_ts()
-    kept, expired, forgotten = [], 0, 0
-    for it in queue["items"]:
-        status = it.get("status", "pending")
-        if status == "pending" and now - it.get("discovered_ts", now) > PENDING_TTL:
-            expired += 1
-            continue
-        if status == "rejected" and now - it.get("decided_ts", it.get("discovered_ts", now)) > REJECTED_KEEP:
-            forgotten += 1
-            continue
-        kept.append(it)
-    pending = [it for it in kept if it.get("status", "pending") == "pending"]
-    if len(pending) > MAX_PENDING_NEWS:
-        pending.sort(key=lambda it: ((it.get("score") or 0), it.get("priority", 0), it.get("discovered_ts", 0)))
-        drop = {id(it) for it in pending[: len(pending) - MAX_PENDING_NEWS]}
-        kept = [it for it in kept if id(it) not in drop]
-        warn("QUEUE", f"Queue limit {MAX_PENDING_NEWS}: dropped {len(drop)} weakest candidates")
-    rejected = [it for it in kept if it.get("status") == "rejected"]
-    if len(rejected) > 600:
-        drop = {id(it) for it in sorted(rejected, key=lambda x: x.get("decided_ts", 0))[: len(rejected) - 600]}
-        kept = [it for it in kept if id(it) not in drop]
-    if expired or forgotten:
-        log("QUEUE", f"Cleanup: {expired} expired, {forgotten} old rejected forgotten")
-    queue["items"] = kept
-
-
-# ---------------- limits ----------------
-
-def posts_in_last_24h(memory, kind):
-    cutoff = now_ts() - 24 * 3600
-    n = 0
-    for e in memory:
-        if e.get("timestamp", 0) >= cutoff and (e.get("kind", "regular") == "breaking") == (kind == "breaking"):
-            n += 1
-    return n
-
-
-def _domain(url):
-    host = (urlparse(url or "").netloc or "").lower()
-    return host[4:] if host.startswith("www.") else host
-
-
-def breaking_source_ok(entries):
-    domains = {_domain(e.get("url", "")) for e in entries if e.get("url") and not is_google_news_url(e.get("url", ""))}
-    domains.discard("")
-    if any(d == t or d.endswith("." + t) for d in domains for t in TRUSTED_DOMAINS):
-        return True
-    return len(domains) >= 2
-
-
-# ---------------- Gemini review (triage) ----------------
-
-def build_triage_prompt(batch, memory, mode):
-    published = []
-    for e in memory[-60:]:
-        label = e.get("post_title") or e.get("topic") or e.get("title")
-        if label:
-            published.append(f"- {label}")
-    published_text = "\n".join(published) if published else "(пока ничего)"
-
-    blocks = []
-    for n, it in enumerate(batch, 1):
-        kind = "полная статья" if it.get("source_type") == "full_article" else "только краткий RSS-анонс"
-        blocks.append("\n".join([
-            f"===== МАТЕРИАЛ =====", f"ARTICLE_ID: {n}", f"ТИП: {kind}",
-            f"ЗАГОЛОВОК: {it.get('title', '')}",
-            "ТЕКСТ (начало):", (it.get("text") or it.get("summary") or "")[:TRIAGE_CHARS],
-        ]))
-
-    rules = [
-        "Ты - главный редактор Telegram-канала LilsNews об EA SPORTS FC 27. Канал читают обычные игроки, "
-        "у которых есть время только на несколько новостей в день.",
-        "Ниже накопившиеся материалы (в основном на английском). Твоя задача - НЕ писать посты, а оценить "
-        "СОБЫТИЯ по важности для обычного игрока FC 27.",
-        "",
-        "ГЛАВНЫЙ ВОПРОС для каждого события: стоит ли это внимания подписчика, у которого есть время на 3 новости в день?",
-        "",
-        "ШКАЛА score (0-100), оценивай реальную пользу, а не ключевые слова:",
-        "- 90-100 BREAKING: крупный официальный патч, серьёзное изменение геймплея или механик, официальный анонс EA, "
-        "крупные изменения Ultimate Team/SBC/наград/рынка/рейтингов, важные изменения Division Rivals / Champions / "
-        "Weekend League, крупный промо-ивент - то, что заденет большую часть игроков и подтверждено.",
-        "- 80-89 HIGH: важная новость, о которой стоит знать многим игрокам.",
-        "- 65-79 MEDIUM: отдельная карта, обычный SBC, objective или evolution, новость об одном игроке, небольшое "
-        "изменение Ultimate Team, небольшой геймплейный гайд.",
-        "- 0-64 LOW: не публиковать. Сюда же: SEO-статьи, 'Top 10 players', 'Best young players', обычные гайды, "
-        "статьи ради трафика, материалы без новой информации, переписанные старые новости, мелочи, "
-        "неподтверждённые слухи без оснований.",
-        "- Не завышай оценки. В обычный день 0-3 события заслуживают 80+, большинство материалов - 20-60.",
-        "",
-        "ОБЪЕДИНЕНИЕ СОБЫТИЙ: несколько материалов об одном событии (например 10 сайтов написали про один промо) - это "
-        "ОДНО событие. Перечисли ВСЕ их ARTICLE_ID в одном объекте. Разные события (патч, SBC, промо, карточка) - "
-        "разные объекты.",
-        "",
-        "ПОЛЯ ОТВЕТА для каждого события: source_ids (все ARTICLE_ID события, главный первым); score; "
-        f"category (одно из: {', '.join(CATEGORY_KEYS)}); topic (3-8 слов НА РУССКОМ); confirmed (true только если "
-        "событие официально подтверждено или надёжно подтверждено несколькими источниками; слух или утечка = false); "
-        "reason (одна короткая фраза на русском - почему такая оценка).",
-        "",
-        "ФАКТЫ: оценивай только по тексту материалов, ничего не выдумывай и не используй свои знания о FC 27.",
-        "Не включай события, которые уже есть в списке 'УЖЕ ОПУБЛИКОВАНО' (даже в другой формулировке).",
-        f"Верни ТОЛЬКО события со score от {MEDIUM_SCORE} и выше. Остальные материалы просто не упоминай. "
-        "Если подходящих событий нет - верни пустой массив events.",
-    ]
-    if mode == "breaking":
-        rules.append("Это срочная проверка: интересуют только события уровня BREAKING (90+). "
-                     "Остальные не возвращай.")
-    rules += [
-        "",
-        "ФОРМАТ ОТВЕТА: только валидный JSON без markdown - объект с полем events "
-        "(массив объектов с полями source_ids, score, category, topic, confirmed, reason).",
-        "",
-        "УЖЕ ОПУБЛИКОВАНО:", published_text, "",
-        "МАТЕРИАЛЫ:", "", "\n\n".join(blocks),
-    ]
-    return "\n".join(rules)
-
-
-def parse_triage(text):
-    """List of raw event dicts, [] if none, None if the response cannot be parsed."""
-    obj = extract_json(text) if text else None
-    if obj is None:
-        return None
-    if isinstance(obj, dict):
-        raw = obj.get("events")
-        if raw is None and "score" in obj:
-            raw = [obj]
-    elif isinstance(obj, list):
-        raw = obj
-    else:
-        raw = None
-    if not isinstance(raw, list):
-        return None
-    events = []
-    for r in raw:
-        if not isinstance(r, dict):
-            continue
-        ids = r.get("source_ids", r.get("source_id", r.get("article_ids")))
-        if isinstance(ids, (int, str)):
-            ids = [ids]
-        clean_ids = []
-        for x in ids or []:
-            try:
-                clean_ids.append(int(str(x).strip()))
-            except ValueError:
-                pass
-        try:
-            score = int(round(float(r.get("score", 0))))
-        except (TypeError, ValueError):
-            score = 0
-        conf = r.get("confirmed", False)
-        if isinstance(conf, str):
-            conf = conf.strip().lower() in ("true", "yes", "да", "1")
-        events.append({
-            "source_ids": clean_ids,
-            "score": max(0, min(100, score)),
-            "category": normalize_category(r.get("category", "")),
-            "topic": clean_text(r.get("topic", ""))[:150],
-            "confirmed": bool(conf),
-            "reason": clean_text(r.get("reason", ""))[:200],
-        })
-    return events
-
-
-def run_triage(batch, memory, mode):
-    """Gemini scores the batch. Returns resolved events (with queue entries) or None on failure."""
-    text = gemini_generate(build_triage_prompt(batch, memory, mode), TRIAGE_SCHEMA, f"editor-{mode}")
-    if text is None:
-        return None
-    raw = parse_triage(text)
-    if raw is None:
-        error("PARSE", "Could not parse the editor response as JSON")
-        log("PARSE", "Raw start: " + text[:300].replace("\n", " "))
-        return None
-    events, used = [], set()
-    for ev in raw:
-        entries = []
-        for sid in ev["source_ids"]:
-            if 1 <= sid <= len(batch) and sid not in used:
-                used.add(sid)
-                entries.append(batch[sid - 1])
-        if not entries:
-            continue
-        ev = dict(ev)
-        ev["entries"] = entries
-        ev["topic"] = ev["topic"] or entries[0].get("title", "")[:100]
-        events.append(ev)
-    events.sort(key=lambda e: e["score"], reverse=True)
-    return events
-
-
-# ---------------- writing + publishing selected events (existing pipeline) ----------------
-
-def write_and_publish(events, memory, kind, max_posts):
-    """Writes posts for the selected events with the normal post pipeline and publishes them.
-    Returns (published_posts, generation_ok)."""
-    materials, editor_events, score_by_url, seen = [], [], {}, set()
-    for ev in events:
-        ids = []
-        for it in ev["entries"]:
-            if id(it) in seen or not it.get("text"):
-                continue
-            seen.add(id(it))
-            m = dict(it)
-            m["id"] = len(materials) + 1
-            m["gemini_text"] = m["text"][:GEMINI_CHARS_PER_ARTICLE]
-            m.setdefault("source_type", "full_article")
-            materials.append(m)
-            ids.append(m["id"])
-            for u in _entry_urls(m):
-                score_by_url[u] = ev["score"]
-        if ids:
-            editor_events.append({"ids": ids, "topic": ev["topic"], "category": ev["category"]})
-    if not materials:
-        return [], True
-
-    log("GEMINI", f"Writing {len(editor_events)} post(s) from {len(materials)} material(s)")
-    text = gemini_generate(build_prompt(materials, memory, editor_events=editor_events), POSTS_SCHEMA, "posts")
-    items = parse_gemini_posts(text) if text is not None else None
-    if items is None:
-        error("EDITOR", "Gemini did not return usable posts - selected events stay in the queue")
-        return [], False
-
-    def annotate(post):
-        post["kind"] = kind
-        scores = [score_by_url[u] for s in post["sources"] for u in _entry_urls(s) if u in score_by_url]
-        post["score"] = max(scores) if scores else None
-
-    out = []
-    process_gemini_items(items, materials, memory, max_posts=max_posts, annotate=annotate, out_posts=out)
-    total = len(out)
-    for i in range(1, total + 1):
-        log("PUBLISH", f"{i}/{total} done: {out[i - 1]['title'][:80]}")
-    return out, True
-
-
-def settle_events(queue, events, published_posts, generation_ok):
-    """Queue bookkeeping after a write/publish attempt."""
-    published_urls = set()
-    for p in published_posts:
-        for s in p["sources"]:
-            published_urls |= _entry_urls(s)
-    done = retry = dropped = 0
-    for ev in events:
-        event_published = any(_entry_urls(it) & published_urls for it in ev["entries"])
-        for it in ev["entries"]:
-            if event_published:
-                if it in queue["items"]:
-                    queue["items"].remove(it)             # now lives in published_news.json
-                continue
-            it["status"] = "pending"
-            if generation_ok:
-                it["attempts"] = it.get("attempts", 0) + 1
-                if it["attempts"] >= MAX_REVIEW_ATTEMPTS:
-                    reject_item(it)
-                    dropped += 1
-                    continue
-            retry += 1
-        if event_published:
-            done += 1
-    if retry or dropped:
-        log("QUEUE", f"Not published: {retry} item(s) kept for the next window, {dropped} dropped after retries")
-    return done
-
-
-# ---------------- editorial window ----------------
-
-def editorial_window(memory, queue):
-    log("EDITOR", "Editorial window started")
-    pending = queue_pending(queue)
-    if not pending:
-        log("EDITOR", "Queue is empty - nothing to review")
-        queue["last_editorial_ts"] = now_ts()
-        return
-
-    remaining = MAX_DAILY_POSTS - posts_in_last_24h(memory, "regular")
-    if remaining <= 0:
-        log("EDITOR", f"Daily limit reached ({MAX_DAILY_POSTS} posts / 24h) - window skipped")
-        queue["last_editorial_ts"] = now_ts()
-        return
-    if not gemini_available():
-        warn("EDITOR", "Gemini unavailable - window postponed, candidates stay in the queue")
-        return                                                   # not marked as done -> retried next cycle
-
-    pending.sort(key=lambda it: (it.get("priority", 0) + 3 * (it.get("score") or 0), it.get("discovered_ts", 0)),
-                 reverse=True)
-    batch = pending[:EDITORIAL_MAX_CANDIDATES]
-    log("EDITOR", f"Reviewing {len(batch)} candidates (pending in queue: {len(pending)})")
-    events = run_triage(batch, memory, "window")
-    if events is None:
-        warn("EDITOR", "Review failed - window postponed")
-        return
-
-    eligible, rejected_items = [], []
-    reviewed = set()
-    for ev in events:
-        for it in ev["entries"]:
-            reviewed.add(id(it))
-            it["score"] = ev["score"]
-        unconfirmed = ev["category"] == "RUMOR" or not ev["confirmed"]
-        threshold = max(MIN_PUBLICATION_SCORE, RUMOR_MIN_SCORE) if unconfirmed else MIN_PUBLICATION_SCORE
-        if ev["score"] >= threshold:
-            eligible.append(ev)
-        elif ev["score"] >= MEDIUM_SCORE and not unconfirmed:
-            log("EDITOR", f"Held (medium, score {ev['score']}): {ev['topic']}")
-        else:
-            rejected_items.extend(ev["entries"])
-    for it in batch:
-        if id(it) not in reviewed:
-            rejected_items.append(it)
-
-    n_publish = min(remaining, EDITORIAL_MAX_POSTS)
-    selected = eligible[:n_publish]
-    for ev in eligible[n_publish:]:
-        log("EDITOR", f"Deferred to the next window (limit): {ev['topic']} - score {ev['score']}")
-
-    for it in rejected_items:
-        reject_item(it)
-
-    if selected:
-        log("EDITOR", "Selected:")
-        for i, ev in enumerate(selected, 1):
-            log("EDITOR", f"{i}. {ev['topic']} - score {ev['score']}")
-    else:
-        log("EDITOR", "No publication-worthy news found")
-    log("EDITOR", f"Rejected {len(rejected_items)} low-value candidates")
-
-    if selected:
-        for ev in selected:
-            for it in ev["entries"]:
-                it["status"] = "selected"
-        save_queue(queue)
-        out, ok = write_and_publish(selected, memory, "regular", n_publish)
-        settle_events(queue, selected, out, ok)
-        log("EDITOR", f"Published in this window: {len(out)}/{len(selected)}")
-    queue["last_editorial_ts"] = now_ts()
-
-
-# ---------------- breaking news ----------------
-
-def breaking_review(memory, queue):
-    now = now_ts()
-    if now - queue.get("last_breaking_check_ts", 0) < BREAKING_CHECK_INTERVAL:
-        return
-    cands = [it for it in queue_pending(queue)
-             if not it.get("breaking_checked") and BREAKING_HINT_RE.search(it.get("title", "") + " " + it.get("summary", ""))]
-    if not cands:
-        return
-    remaining = MAX_BREAKING_PER_DAY - posts_in_last_24h(memory, "breaking")
-    if remaining <= 0:
-        log("EDITOR", f"Breaking limit reached ({MAX_BREAKING_PER_DAY} / 24h)")
-        return
-    if not gemini_available():
-        return
-
-    queue["last_breaking_check_ts"] = now
-    batch = cands[:EDITORIAL_MAX_CANDIDATES]
-    log("EDITOR", f"Breaking check: {len(batch)} candidate(s) with official/major signals")
-    events = run_triage(batch, memory, "breaking")
-    if events is None:
-        return
-    for it in batch:
-        it["breaking_checked"] = True
-    selected = []
-    for ev in events:
-        for it in ev["entries"]:
-            it["score"] = ev["score"]
-        ok = (ev["score"] >= BREAKING_SCORE and ev["confirmed"] and ev["category"] != "RUMOR"
-              and breaking_source_ok(ev["entries"]))
-        if ev["score"] >= BREAKING_SCORE and not ok:
-            log("EDITOR", f"Not breaking (unconfirmed / unreliable source): {ev['topic']} - score {ev['score']}")
-        if ok:
-            selected.append(ev)
-    if not selected:
-        log("EDITOR", "No breaking news")
-        return
-    selected = selected[:remaining]
-    for ev in selected:
-        log("EDITOR", f"BREAKING: {ev['topic']} - score {ev['score']}")
-        for it in ev["entries"]:
-            it["status"] = "selected"
-    save_queue(queue)
-    out, ok = write_and_publish(selected, memory, "breaking", remaining)
-    settle_events(queue, selected, out, ok)
-
-
-# ---------------- cycle ----------------
-
-def search_and_queue(memory, queue):
-    raw_news = get_news()
-    if not raw_news:
-        log("RSS", "No FC 27 news found")
-        return
-    fresh = select_fresh_news(raw_news, memory, queue_items=queue["items"])
-    if not fresh:
-        log("RSS", "Found 0 new candidates")
-        return
-    articles = prepare_articles(fresh)
-    added, merged = queue_add(queue, articles)
-    log("RSS", f"Found {added} new candidates (merged into existing events: {merged})")
-
-
-def run_editorial_cycle(memory, queue):
-    banner("NEWS SEARCH STARTED")
-    try:
-        search_and_queue(memory, queue)
-    except Exception as exc:
-        error("CYCLE", f"Search stage failed: {err_text(exc)}")
-    queue_prune(queue)
-    save_queue(queue)
-
-    now = now_ts()
-    if queue.get("last_editorial_ts", 0) <= 0 or queue["last_editorial_ts"] > now:
-        queue["last_editorial_ts"] = now
-        log("EDITOR", f"Editorial timer started: first window in {_minutes(EDITORIAL_INTERVAL)}")
-        save_queue(queue)
-    pending = queue_pending(queue)
-    log("QUEUE", f"Pending: {len(pending)}")
-
-    try:
-        breaking_review(memory, queue)
-    except Exception as exc:
-        error("EDITOR", f"Breaking review failed: {err_text(exc)}")
-
-    now = now_ts()
-    if now - queue["last_editorial_ts"] >= EDITORIAL_INTERVAL:
-        try:
-            editorial_window(memory, queue)
-        except Exception as exc:
-            error("EDITOR", f"Editorial window failed: {err_text(exc)}")
-    else:
-        left = EDITORIAL_INTERVAL - (now - queue["last_editorial_ts"])
-        log("EDITOR", f"Next editorial window in {_minutes(left)}")
-
-    queue_prune(queue)
-    save_queue(queue)
-    log("MEMORY", f"Published items in memory: {len(memory)} "
-                  f"(regular last 24h: {posts_in_last_24h(memory, 'regular')}/{MAX_DAILY_POSTS}, "
-                  f"breaking: {posts_in_last_24h(memory, 'breaking')}/{MAX_BREAKING_PER_DAY})")
-    return memory
-
-
-# ============================================================
 # STARTUP
 # ============================================================
 
@@ -3056,13 +2402,7 @@ def validate_config():
 def main():
     banner("LILSNEWS STARTED")
     log("START", f"Python {sys.version.split()[0]}, PID {os.getpid()}")
-    if EDITORIAL_MODE:
-        log("START", f"EDITORIAL MODE: search every {SEARCH_INTERVAL // 60} min, "
-                     f"editorial window every {_minutes(EDITORIAL_INTERVAL)}, max {MAX_DAILY_POSTS} posts/day, "
-                     f"min score {MIN_PUBLICATION_SCORE}, breaking from {BREAKING_SCORE}")
-    else:
-        log("START", f"CLASSIC MODE (immediate publishing): interval {CHECK_INTERVAL // 60} min, "
-                     f"max posts per cycle: {MAX_POSTS_PER_CYCLE}")
+    log("START", f"Interval: {CHECK_INTERVAL // 60} min, max posts per cycle: {MAX_POSTS_PER_CYCLE}")
     log("START", f"Gemini models: {', '.join(GEMINI_MODELS)}")
 
     if not validate_config():
@@ -3071,7 +2411,6 @@ def main():
 
     memory = load_memory()
     log("MEMORY", f"Loaded: {len(memory)} published items")
-    queue = load_queue() if EDITORIAL_MODE else None
 
     if not test_telegram():
         error("TELEGRAM", "Connection failed. Bot stopped.")
@@ -3085,10 +2424,7 @@ def main():
         except Exception:
             pass
         try:
-            if EDITORIAL_MODE:
-                memory = run_editorial_cycle(memory, queue)
-            else:
-                memory = run_cycle(memory)
+            memory = run_cycle(memory)
         except KeyboardInterrupt:
             log("START", "Stopped by user")
             break
@@ -3100,9 +2436,9 @@ def main():
             except Exception:
                 pass
 
-        log("SLEEP", f"Next search in {SEARCH_INTERVAL // 60} minutes")
+        log("SLEEP", f"Waiting {CHECK_INTERVAL // 60} minutes...")
         try:
-            time.sleep(SEARCH_INTERVAL)
+            time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
             log("START", "Stopped by user")
             break
